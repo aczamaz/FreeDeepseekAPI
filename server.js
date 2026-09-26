@@ -6,7 +6,8 @@
  * parses LLM text responses for TOOL_CALL patterns, returns OpenAI tool_calls format.
  * 
  * Per-agent sessions: each unique `user` field gets its own DeepSeek web session.
- * Auto-reset: sessions reset when message chain reaches 100 messages or age > 2 hours.
+ * Auto-reset: sessions reset when message chain reaches DEEPSEEK_MAX_MESSAGE_DEPTH (default 100)
+ * or age exceeds DEEPSEEK_SESSION_TTL_MS (default 6 hours).
  * Listens on 127.0.0.1:9655 by default (HOST is configurable)
  */
 
@@ -18,10 +19,11 @@ const readline = require('readline');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
+const authConfig = require('./lib/auth_config');
 
 // Per-DeepSeek-request network timeout. Plain fetch() has NO default timeout, so a
 // stalled upstream would hang the inbound request (and pin the account) forever.
-const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 60000);
+const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 180000);
 function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
     return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
 }
@@ -139,10 +141,13 @@ function markContextCompacted(res) {
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
-const MAX_HISTORY_LENGTH = 15;
-const MAX_HISTORY_CHARS = 10000;
-const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+// Recovery buffer: replayed only when a remote chat is missing, so the remote
+// session is the primary context. Kept small on purpose — an agent can re-read
+// what it needs through tools, and a big buffer bloats every fresh prompt.
+const MAX_HISTORY_LENGTH = Number(process.env.DEEPSEEK_MAX_HISTORY_LENGTH || 3);
+const MAX_HISTORY_CHARS = Number(process.env.DEEPSEEK_MAX_HISTORY_CHARS || 2000);
+const MAX_MESSAGE_DEPTH = Number(process.env.DEEPSEEK_MAX_MESSAGE_DEPTH || 100);  // auto-reset after this many messages
+const SESSION_TTL_MS = Number(process.env.DEEPSEEK_SESSION_TTL_MS || 6 * 60 * 60 * 1000);  // 6 hours
 
 // === DeepSeek Web API Config — loaded from external config file ===
 const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'deepseek-auth.json');
@@ -154,8 +159,26 @@ let accountRoundRobin = 0;
 let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // Overall wall-clock budget for one inbound request (caps the retry/continuation
 // loops), max concurrent completions, and the empty-response retry cap.
-const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 120000);
+const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 300000);
 const MAX_CONCURRENT = Number(process.env.DEEPSEEK_MAX_CONCURRENT || 24);
+// Minimum pause between logical upstream requests on the same account. Spaces out
+// PoW + session-create + completion bursts so DeepSeek is less likely to 429.
+const MIN_REQUEST_INTERVAL_MS = Math.max(0, Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 5000));
+// Extra random pause (0..this) added on top of the interval so several agents
+// never march upstream in lockstep and look like a scripted burst.
+const REQUEST_JITTER_MS = Math.max(0, Number(process.env.DEEPSEEK_REQUEST_JITTER_MS ?? 2000));
+// Gap between the individual upstream calls of one logical turn (PoW challenge,
+// chat_session/create, completion).
+const UPSTREAM_CALL_GAP_MS = Math.max(0, Number(process.env.DEEPSEEK_UPSTREAM_CALL_GAP_MS ?? 700));
+// Base cooldown applied when DeepSeek reports "sending too often" inside the
+// response stream; it doubles on every repeat up to DEEPSEEK_ACCOUNT_COOLDOWN_MS.
+// Long by default: this notice is an account-level throttle, not a 1s burst, so
+// retrying within a minute only extends the block.
+const RATE_LIMIT_COOLDOWN_MS = Math.max(1000, Number(process.env.DEEPSEEK_RATE_LIMIT_COOLDOWN_MS || 300000));
+// How long to wait for a sticky account that is cooling down (e.g. after 429)
+// before giving up with 429. Waiting preserves the remote chat session instead
+// of rotating accounts and forcing a brand-new chat.
+const STICKY_WAIT_MS = Math.max(0, Number(process.env.DEEPSEEK_STICKY_WAIT_MS ?? 60000));
 const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
 const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
     ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
@@ -165,6 +188,13 @@ const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
 const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
     : 80000;
+// A brand-new chat is the riskiest upstream call: the whole client transcript
+// lands in one first message and DeepSeek can answer it with an abuse notice.
+// New sessions therefore start from a much smaller budget.
+const configuredFreshChars = Number(process.env.DEEPSEEK_FRESH_SESSION_PROMPT_CHARS);
+const FRESH_SESSION_PROMPT_CHARS = Number.isFinite(configuredFreshChars)
+    ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredFreshChars))
+    : 24000;
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -194,9 +224,17 @@ function discoverAuthPaths() {
             return [];
         }
     }
-    if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
-        return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+    if (process.env.DEEPSEEK_AUTH_PATH) {
+        if (process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
+            return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        return [DS_CONFIG_PATH];
     }
+    // Multi-account pool wins by default so `npm start` needs no env at all:
+    // every data/accounts/*.json becomes an account. The single-file path stays
+    // the fallback for a fresh checkout.
+    const pool = authConfig.accountFiles();
+    if (pool.length > 0) return pool;
     return [DS_CONFIG_PATH];
 }
 function loadDeepSeekConfig({ fatal = true } = {}) {
@@ -207,7 +245,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
             const raw = fs.readFileSync(file, 'utf8');
             const config = JSON.parse(raw);
             const id = `account_${accounts.length + 1}`;
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, lastUsedAt: 0 });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, lastUsedAt: 0, nextSlotAt: 0, lastUpstreamCallAt: 0, rateLimitStreak: 0 });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -233,24 +271,41 @@ function accountStatus(account) {
         cooldown_remaining_sec: Math.max(0, Math.ceil((account.cooldownUntil - Date.now()) / 1000)),
         failures: account.failures,
         last_used_at: account.lastUsedAt || null,
+        rate_limit_streak: account.rateLimitStreak || 0,
     };
 }
-function selectAccountForSession(session) {
+async function selectAccountForSession(session) {
     const now = Date.now();
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
-        if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
-        // A DeepSeek chat_session belongs to the auth account that created it.
-        // If that account disappeared, lost credentials, or is cooling down,
-        // never reuse its session id under a different account.
+        if (sticky && sticky.config.token && sticky.config.cookie) {
+            if (sticky.cooldownUntil <= now) return sticky;
+            // Sticky account is cooling down (429/401/403). A DeepSeek chat_session
+            // belongs to the auth account that created it, so never rotate away
+            // just because of a cooldown — that would force a brand-new chat.
+            // Wait out short cooldowns; otherwise surface 429 with Retry-After and
+            // leave the session untouched so the client can retry on the same chat.
+            const remainingMs = sticky.cooldownUntil - now;
+            if (remainingMs <= STICKY_WAIT_MS) {
+                console.log(`[account:${sticky.id}] sticky cooldown ${Math.ceil(remainingMs / 1000)}s ≤ wait cap ${Math.ceil(STICKY_WAIT_MS / 1000)}s; waiting (session preserved)`);
+                await new Promise(r => setTimeout(r, remainingMs));
+                if (sticky.cooldownUntil <= Date.now()) return sticky;
+            }
+            const waitSec = Math.max(1, Math.ceil((sticky.cooldownUntil - Date.now()) / 1000));
+            const err = new Error(`Sticky account ${sticky.id} is cooling down. Retry in ~${waitSec}s (session preserved).`);
+            err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
+            throw err;
+        }
+        // Account disappeared from the pool or lost credentials — only then is it
+        // safe to drop its session id and pick another account.
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= Date.now());
     if (ready.length === 0) {
         const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
-            const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - now) / 1000));
+            const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - Date.now()) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
             // generic 500 (integrator backoff keys on the status code, not the text).
             const err = new Error(`All DeepSeek auth accounts are cooling down. Retry in ~${waitSec}s or import a fresh account with npm run auth:import.`);
@@ -265,6 +320,41 @@ function selectAccountForSession(session) {
     accountRoundRobin++;
     session.accountId = account.id;
     return account;
+}
+// DeepSeek also throttles the individual HTTP calls inside one logical turn
+// (PoW challenge, chat_session/create, completion). Keep a small gap between
+// them so a single request never looks like a scripted burst.
+async function paceUpstreamCall(account, gapMs = UPSTREAM_CALL_GAP_MS) {
+    if (!account || !(gapMs > 0)) return 0;
+    const now = Date.now();
+    const waitMs = Math.max(0, (account.lastUpstreamCallAt || 0) + gapMs - now);
+    if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+    account.lastUpstreamCallAt = Date.now();
+    return waitMs;
+}
+// Reserve the next upstream slot on an account so consecutive logical requests
+// are at least intervalMs apart (plus optional jitter). Atomic in Node's
+// single-threaded model: each caller claims earliest = max(nextSlotAt, now) and
+// advances the pointer, so concurrent callers queue up spaced by the interval.
+async function acquireAccountSlot(account, intervalMs = MIN_REQUEST_INTERVAL_MS, jitterMs = REQUEST_JITTER_MS) {
+    if (!account || !(intervalMs > 0)) return 0;
+    const now = Date.now();
+    const earliest = Math.max(account.nextSlotAt || 0, now);
+    const waitMs = earliest - now;
+    if (waitMs > REQUEST_DEADLINE_MS) {
+        const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
+        const err = new Error(`Upstream pacing queue is full. Retry in ~${waitSec}s.`);
+        err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
+        throw err;
+    }
+    // Jitter is always additive: it can only lengthen the gap, never shorten it
+    // below the configured interval.
+    const spread = jitterMs > 0 ? Math.floor(Math.random() * jitterMs) : 0;
+    const gapMs = intervalMs + spread;
+    account.nextSlotAt = earliest + gapMs;
+    const totalWaitMs = waitMs > 0 ? waitMs + spread : 0;
+    if (totalWaitMs > 0) await new Promise(r => setTimeout(r, totalWaitMs));
+    return totalWaitMs;
 }
 // Parse a Retry-After header value into a cooldown duration in ms, or null if
 // absent/unparseable. Supports both forms: delta-seconds (e.g. "120") and an
@@ -530,7 +620,8 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
-    const account = selectAccountForSession(session);
+    const account = await selectAccountForSession(session);
+    await acquireAccountSlot(account);
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     const agentTag = `[${agentId}/acct:${account.id}]`;
@@ -549,6 +640,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         console.log(`${agentTag} Session ${rollover.failedSessionId} reset before upstream call (${rollover.reason}).`);
     }
 
+    await paceUpstreamCall(account);
     const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
         method: 'POST', headers: dsHeaders,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
@@ -568,6 +660,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     const answer = await solvePOW(challenge, account.config.wasmUrl);
 
     if (!session.id) {
+        await paceUpstreamCall(account);
         const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers: dsHeaders, body: '{}'
         });
@@ -591,6 +684,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         salt: challenge.salt, answer: answer,
         signature: challenge.signature, target_path: '/api/v0/chat/completion'
     })).toString('base64');
+    await paceUpstreamCall(account);
     const resp = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
         headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
@@ -634,6 +728,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
                 salt: challenge.salt, answer: answer,
                 signature: challenge.signature, target_path: '/api/v0/chat/completion'
             })).toString('base64');
+            await paceUpstreamCall(account);
             const resp2 = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
                 method: 'POST',
                 headers: { ...dsHeaders, 'X-DS-PoW-Response': newPowB64 },
@@ -653,6 +748,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
                 throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
             }
             effectivePrompt = freshSessionPrompt;
+            account.rateLimitStreak = 0;
             return { resp: resp2, agentId, account, promptUsed: effectivePrompt, freshSessionReset: true };
         }
         // The body was consumed for diagnostics, so returning this Response
@@ -661,6 +757,9 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
+    // A completed turn proves the account is healthy again: forget any earlier
+    // rate-limit streak so the next escalation restarts from the base cooldown.
+    account.rateLimitStreak = 0;
     return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
 }
 
@@ -1098,6 +1197,26 @@ function parseDsmlToolCall(text) {
 
 function looksLikeToolCallMarkup(text) {
     return /TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(String(text || ''));
+}
+
+// Unparseable tool markup is the one failure we cannot diagnose from the logs
+// alone, and it is rare enough to be worth keeping. Drop the raw model output
+// next to the other debug artifacts so the format can be fixed offline.
+function dumpFailedToolMarkup(label, ...parts) {
+    try {
+        const os = require('os');
+        const dir = path.join(os.tmpdir(), 'deepseek_response_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
+        const body = parts
+            .filter(p => typeof p === 'string' && p.trim())
+            .map((p, i) => `--- part ${i + 1} (${p.length} chars) ---\n${p}`)
+            .join('\n\n');
+        fs.writeFileSync(dir, `[${label}]\n\n${body}`);
+        console.log(`[tool-markup] Raw output saved: ${dir}`);
+        return dir;
+    } catch (e) {
+        console.log(`[tool-markup] Could not save raw output: ${e.message}`);
+        return null;
+    }
 }
 
 function parseToolCall(text) {
@@ -1691,6 +1810,29 @@ function isContextTooLongError(error) {
     return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message);
 }
 
+// DeepSeek reports "sending too often" as an error fragment inside an HTTP 200
+// stream rather than a 429, so the text has to be recognised explicitly.
+// Without this the account is never cooled down and the chat is reset on sight.
+function isRateLimitMessage(error) {
+    const message = typeof error === 'string'
+        ? error
+        : `${error?.content || ''} ${error?.message || ''} ${error?.finish_reason || ''} ${error?.type || ''}`;
+    return /too\s+(?:many|often|frequent|soon)|rate[\s_-]?limit|request\s+limit|请求过于频繁|请求太频繁|操作过于频繁|过于频繁|稍后再试|请稍后|слишком\s+(?:част|много)|слишком\s+часто|слишком\s+часто\s+повтор/i.test(message);
+}
+
+// Cool an account down after a stream-level rate-limit notice, escalating while
+// the abuse repeats so a single unlucky burst does not park the account for the
+// full cooldown. Returns the cooldown in whole seconds for Retry-After.
+function markRateLimited(account, reason = 'stream rate limit') {
+    if (!account) return Math.max(1, Math.ceil(DEFAULT_ACCOUNT_COOLDOWN_MS / 1000));
+    account.rateLimitStreak = (account.rateLimitStreak || 0) + 1;
+    account.failures++;
+    const cooldownMs = Math.min(DEFAULT_ACCOUNT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_MS * Math.pow(2, account.rateLimitStreak - 1));
+    account.cooldownUntil = Date.now() + cooldownMs;
+    console.log(`[account:${account.id}] stream rate limit (${reason}); cooldown ${Math.round(cooldownMs / 1000)}s (streak ${account.rateLimitStreak})`);
+    return Math.max(1, Math.ceil(cooldownMs / 1000));
+}
+
 function normalizeRetryResponse(result) {
     return {
         content: result?.content ? sanitizeContent(result.content) : '',
@@ -1701,6 +1843,7 @@ function normalizeRetryResponse(result) {
 }
 
 function classifyRecoveryFailure(modelError, timedOut = false) {
+    if (isRateLimitMessage(modelError)) return { status: 429, type: 'rate_limit_error' };
     if (isContextTooLongError(modelError)) return { status: 400, type: 'context_length_exceeded' };
     if (timedOut) return { status: 504, type: 'request_timeout' };
     return { status: 502, type: modelError?.type || 'empty_response' };
@@ -1710,6 +1853,39 @@ function isTimeoutError(error) {
     const name = String(error?.name || '');
     const message = String(error?.message || '');
     return name === 'TimeoutError' || name === 'AbortError' || /(?:timed?\s*out|timeout)/i.test(message);
+}
+
+// Serialize an assistant turn the same way storeHistory persists it, so a
+// client-echoed assistant message can be compared against our last reply.
+function serializeAssistantTurn(msg) {
+    if (!msg || msg.role !== 'assistant') return null;
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+        return msg.tool_calls
+            .map(tc => `TOOL_CALL: ${tc?.function?.name || ''}\narguments: ${tc?.function?.arguments || ''}`)
+            .join('\n');
+    }
+    return msg.content ? normalizeMessageContent(msg.content) : null;
+}
+
+// A live remote chat already holds the conversation, so only the new tail is
+// sent. Replaying the whole transcript on every turn grows the remote context
+// quadratically — that is what used to kill long-lived chats after ~17-34
+// messages. Returns null whenever our view of the chain cannot be proven, and
+// the caller falls back to the full transcript.
+function selectDeltaMessages(messages, session) {
+    if (!session || !session.id) return null;
+    const lastEntry = session.history[session.history.length - 1];
+    const expected = lastEntry && lastEntry.assistant ? String(lastEntry.assistant).trim() : '';
+    if (!expected) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const serialized = serializeAssistantTurn(messages[i]);
+        if (!serialized) continue;
+        if (serialized.trim() !== expected) return null;  // diverged chain
+        const tail = messages.slice(i + 1);
+        const hasNewInput = tail.some(m => m && (m.role === 'user' || m.role === 'tool'));
+        return hasNewInput ? tail : null;
+    }
+    return null;
 }
 
 function formatMessages(messages, tools) {
@@ -1952,7 +2128,6 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            const { prompt, systemPrompt } = formatMessages(messages, tools);
             // For usage accounting, count the CLIENT's original input — not the
             // proxy-expanded fullPrompt (system + injected tools + history) — so
             // prompt_tokens reflects what the caller actually sent.
@@ -1968,6 +2143,16 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} Session ${promptRollover.failedSessionId} reset before prompt build (${promptRollover.reason}); recovery history preserved.`);
             }
 
+            // Send only the new tail when the remote chat is provably in sync;
+            // otherwise fall back to the whole transcript. The recovery path keeps
+            // using the full transcript so a recreated chat never loses context.
+            const deltaMessages = selectDeltaMessages(messages, session);
+            const { prompt, systemPrompt } = formatMessages(deltaMessages || messages, tools);
+            const recoveryPromptSource = deltaMessages ? formatMessages(messages, tools).prompt : prompt;
+            if (deltaMessages) {
+                console.log(`${agentTag} Delta prompt: ${deltaMessages.length} new message(s) instead of ${messages.length} (remote session ${session.id}).`);
+            }
+
             // Keep a recovery prompt available even while the upstream session
             // is healthy. If that remote chat expires mid-request, its opaque
             // state disappears and the replacement must receive local history.
@@ -1976,13 +2161,14 @@ const server = http.createServer(async (req, res) => {
                 : buildRecoveryHistoryPrefix(session.history);
             const historyPrefix = !session.id ? recoveryHistoryPrefix : '';
 
-            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt);
-            const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, prompt);
+            const livePromptBudget = session.id ? MAX_UPSTREAM_PROMPT_CHARS : FRESH_SESSION_PROMPT_CHARS;
+            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt, livePromptBudget);
+            const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, recoveryPromptSource, FRESH_SESSION_PROMPT_CHARS);
             let fullPrompt = promptBuild.prompt;
             let promptCompacted = promptBuild.compacted;
             if (promptBuild.compacted) {
                 markContextCompacted(res);
-                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}`);
+                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}${session.id ? '' : ' (new chat budget)'}`);
             }
 
             const startTime = Date.now();
@@ -2096,9 +2282,12 @@ const server = http.createServer(async (req, res) => {
             const elapsed = Date.now() - startTime;
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
-            // Empty/context-overflow recovery. Each retry gets a smaller prompt
-            // and a fresh remote session; bounded attempts prevent retry storms.
+            // Empty/context-overflow recovery. The first retry reuses the live
+            // remote session with a smaller prompt — an empty response is usually
+            // a transient upstream hiccup, not a dead chat. Only a second empty
+            // response justifies throwing the chat away.
             let retryAttempt = 0;
+            let keptSessionForRetry = false;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
@@ -2113,15 +2302,23 @@ const server = http.createServer(async (req, res) => {
                     ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
                     : Math.max(0.5, 1 - retryAttempt * 0.2);
                 const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
-                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, prompt, fullPrompt, retryBudget);
+                // A retry may run against a recreated chat, so it always carries
+                // the full transcript rather than the delta tail.
+                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, recoveryPromptSource, fullPrompt, retryBudget);
                 const retryPrompt = retryBuild.prompt;
                 if (retryBuild.compacted) {
                     promptCompacted = true;
                     markContextCompacted(res);
                 }
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
-                console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
-                resetRemoteSession(session);
+                const reuseSession = !keptSessionForRetry && Boolean(session.id);
+                if (reuseSession) {
+                    keptSessionForRetry = true;
+                    console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Retrying on the same session...`);
+                } else {
+                    console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Resetting session...`);
+                    resetRemoteSession(session);
+                }
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
@@ -2141,7 +2338,31 @@ const server = http.createServer(async (req, res) => {
 
             if (!fullContent || fullContent.trim().length === 0) {
                 const timedOut = deadlineHit();
+                // "Sending too often" arrives as a stream error inside HTTP 200.
+                // Cool the account down, keep the chat, and let the client retry —
+                // resetting here is what used to spawn a new chat per complaint.
+                if (isRateLimitMessage(modelError)) {
+                    const limitedAccount = accounts.find(a => a.id === session.accountId) || null;
+                    const retryAfterSec = markRateLimited(limitedAccount, String(modelError?.content || '').slice(0, 80));
+                    console.log(`${agentTag} rate limited by DeepSeek; session ${session.id} preserved, retry in ${retryAfterSec}s.`);
+                    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfterSec) });
+                    res.end(JSON.stringify({
+                        error: {
+                            message: `DeepSeek throttled this auth account ("${String(modelError?.content || 'too many requests').substring(0, 120)}"). The chat was kept — retry in ~${retryAfterSec}s. If it keeps happening, the account itself is rate-limited: add a second account (npm run auth:import, DEEPSEEK_AUTH_DIR=./accounts) or wait it out.`,
+                            type: 'rate_limit_error',
+                            agent: agentId,
+                            session_preserved: true,
+                            account: session.accountId,
+                            retry_after_sec: retryAfterSec,
+                            model: requestedModel,
+                            real_model: resolveModelConfig(requestedModel).real_model,
+                        }
+                    }));
+                    return;
+                }
                 const failureClass = classifyRecoveryFailure(modelError, timedOut);
+                // The chat already lost every retry attempt: a fresh upstream turn
+                // is the only way forward, so the dead session id is dropped here.
                 const failure = resetRemoteSession(session);
                 const errorType = failureClass.type;
                 const errorMessage = modelError?.content
@@ -2224,18 +2445,29 @@ const server = http.createServer(async (req, res) => {
             
             // Retry once if legacy, XML, or DSML tool markup was truncated or
             // malformed. Never pass raw DSML through as a normal assistant turn.
+            let repairContent = '';
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent) && !clientGone && !deadlineHit()) {
                 console.log(`${agentTag} Tool-call markup detected but invalid/truncated (${fullContent.length} chars). Retrying with stricter prompt...`);
-                resetRemoteSession(session);
+                // Formatting failure is the model's, not the chat's — retry on the
+                // same session so the conversation survives the repair attempt.
                 await new Promise(r => setTimeout(r, 1000));
-                const strictPrompt = appendPromptInstruction(
-                    freshPromptBuild.prompt,
-                    '[STRICT INSTRUCTION] Your previous response contained incomplete tool-call markup. Keep arguments short and output ONLY strict JSON: {"tool_call":{"name":"<function>","arguments":{...}}}'
-                );
+                // Retry the exact prompt that produced the broken markup, so the
+                // repair works whether the session was reused or recreated. The
+                // allowed names and the hard size cap are what actually rescue a
+                // truncated reply: the model stops trying to inline big payloads.
+                const strictInstruction = [
+                    '[STRICT INSTRUCTION] Your previous reply was discarded because its tool-call markup was incomplete or cut off.',
+                    'Reply with EXACTLY ONE tool call and nothing else: no prose, no markdown fence, no explanation before or after.',
+                    'Required JSON shape: {"tool_call":{"name":"<function_name>","arguments":{...}}}',
+                    `Valid function names: ${[...allowedToolNames].join(', ')}`,
+                    'Hard limit: 600 characters for the whole reply. Keep arguments minimal — pass short strings, file paths and small edits only; never inline large file contents or long command output.',
+                ].join('\n');
+                const strictPrompt = appendPromptInstruction(fullPrompt, strictInstruction);
                 const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel);
                 const retryResult2 = await readDeepSeekResponse(retryResp2.body);
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
+                    repairContent = retryContent2;
                     const retryTc = parseToolCall(retryContent2);
                     if (retryTc && allowedToolNames.has(retryTc.name)) {
                         console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
@@ -2250,13 +2482,26 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
+                dumpFailedToolMarkup(
+                    `agent=${agentId} model=${requestedModel} real_model=${resolveModelConfig(requestedModel).real_model} account=${session.accountId} session=${session.id} msg#${session.messageCount} finish_reason=${finishReason} chars=${fullContent.length}`,
+                    fullContent,
+                    repairContent
+                );
+                console.log(`[tool-markup] finish_reason=${finishReason} chars=${fullContent.length} first 200: ${JSON.stringify(fullContent.slice(0, 200))}`);
+                if (repairContent) console.log(`[tool-markup] repair finish_reason=${finishReason} chars=${repairContent.length} first 200: ${JSON.stringify(repairContent.slice(0, 200))}`);
+                // A chat that has drifted into an unparseable tool format stays
+                // broken: the same session just replays the same failure for the
+                // client forever. Keep the local history and the sticky account,
+                // but drop the remote chat so the next attempt re-primes the
+                // format from a clean conversation.
                 const failure = resetRemoteSession(session);
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: {
-                    message: 'DeepSeek returned malformed tool-call markup after one repair attempt',
+                    message: 'DeepSeek returned malformed tool-call markup after one repair attempt; the remote chat was reset, retry the request',
                     type: 'malformed_tool_call',
                     agent: agentId,
                     failed_session_id: failure.failedSessionId,
+                    session_reset: true,
                     message_count: failure.failedMessageCount,
                     history_length: session.history.length,
                     account: failure.accountId,
@@ -2314,7 +2559,14 @@ const server = http.createServer(async (req, res) => {
             const headers = { 'Content-Type': 'application/json' };
             if (status === 429 && e.retryAfter) headers['Retry-After'] = String(e.retryAfter);
             res.writeHead(status, headers);
-            const failure = timedOut && activeSession ? resetRemoteSession(activeSession) : null;
+            // A timeout consumes our wall-clock budget, not the remote chat's
+            // validity — keep the session so the next request continues the same
+            // conversation instead of forcing a brand-new chat.
+            const failure = (timedOut && activeSession) ? {
+                failedSessionId: activeSession.id,
+                failedMessageCount: activeSession.messageCount,
+                accountId: activeSession.accountId,
+            } : null;
             res.end(JSON.stringify({ error: {
                 message: e.message,
                 type: e.type || (timedOut ? 'request_timeout' : 'server_error'),
@@ -2342,7 +2594,9 @@ async function runAuthScript() {
 function printStatus() {
     console.log(`\n${formatWatermark()}`);
     console.log(`Auth: ${hasAuthConfig() ? '✅ OK' : '❌ не найден deepseek-auth.json'}`);
-    console.log(`Auth source: ${process.env.DEEPSEEK_AUTH_DIR || DS_CONFIG_PATH}`);
+    const authSource = process.env.DEEPSEEK_AUTH_DIR
+        || (authConfig.hasAccountFiles() ? `data/accounts (${accounts.length} account(s))` : DS_CONFIG_PATH);
+    console.log(`Auth source: ${authSource}`);
     console.log(`Аккаунты: ${accounts.length ? accounts.map(a => `${a.id}${a.cooldownUntil > Date.now() ? ' (cooldown)' : ''}`).join(', ') : 'нет'}`);
     console.log(`Рабочие модели: ${SUPPORTED_MODEL_IDS.join(', ')}`);
     console.log('Нерабочие/скрытые aliases: ' + Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported).join(', '));
@@ -2442,6 +2696,7 @@ module.exports = {
         parseToolCall,
         parseDsmlToolCall,
         looksLikeToolCallMarkup,
+        dumpFailedToolMarkup,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
         buildRecoveryHistoryPrefix,
@@ -2453,6 +2708,12 @@ module.exports = {
         classifyRecoveryFailure,
         isTimeoutError,
         formatMessages,
+        serializeAssistantTurn,
+        selectDeltaMessages,
+        MAX_HISTORY_LENGTH,
+        MAX_HISTORY_CHARS,
+        DS_FETCH_TIMEOUT_MS,
+        REQUEST_DEADLINE_MS,
         createSession,
         resetRemoteSession,
         prepareSessionForPrompt,
@@ -2460,6 +2721,18 @@ module.exports = {
         sessions,
         accounts,
         selectAccountForSession,
+        acquireAccountSlot,
+        paceUpstreamCall,
+        isRateLimitMessage,
+        markRateLimited,
+        MIN_REQUEST_INTERVAL_MS,
+        REQUEST_JITTER_MS,
+        UPSTREAM_CALL_GAP_MS,
+        RATE_LIMIT_COOLDOWN_MS,
+        FRESH_SESSION_PROMPT_CHARS,
+        STICKY_WAIT_MS,
+        MAX_MESSAGE_DEPTH,
+        SESSION_TTL_MS,
         isProxyAuthorized,
         loadProxyApiKey,
         requireProxyApiKey,

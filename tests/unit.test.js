@@ -7,6 +7,24 @@ const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
 const serverInternals = require('../server.js').__test;
+const authConfig = require('../lib/auth_config');
+
+test('multi-account pool is the default auth source so npm start needs no env', () => {
+  const files = authConfig.accountFiles();
+  assert.ok(Array.isArray(files));
+  // Every pool entry is a real file inside the gitignored data/accounts dir.
+  for (const file of files) {
+    assert.ok(file.startsWith(authConfig.ACCOUNT_DIR + path.sep), `${file} is outside the pool dir`);
+    assert.ok(fs.existsSync(file));
+  }
+  // Scripts that write auth must target the pool once it exists, otherwise
+  // `npm run auth` would refresh a file the server never loads.
+  if (files.length > 0) {
+    assert.equal(authConfig.defaultAuthPath(), path.join(authConfig.ACCOUNT_DIR, 'main.json'));
+  } else {
+    assert.equal(authConfig.defaultAuthPath(), authConfig.LEGACY_AUTH_FILE);
+  }
+});
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
@@ -430,6 +448,21 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
   }
 });
 
+test('failed tool markup is dumped to a file so the format can be fixed offline', () => {
+  const first = 'half-written tool call: {"tool_call": {"name": "read_file"';
+  const repair = '{"tool_call":{"name":"read_file","argu';
+  const before = new Set(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('deepseek_response_')));
+  const file = serverInternals.dumpFailedToolMarkup('unit-test', first, repair);
+  assert.ok(file, 'dump path must be returned');
+  const saved = fs.readFileSync(file, 'utf8');
+  assert.match(saved, /unit-test/);
+  assert.match(saved, /half-written tool call/);
+  assert.match(saved, /"argu/);
+  fs.rmSync(file, { force: true });
+  const after = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('deepseek_response_') && !before.has(f));
+  assert.deepEqual(after, [], 'no dump files may be left behind');
+});
+
 test('tool schema compaction drops prose annotations but preserves validation shape', () => {
   const compact = serverInternals.compactToolSchema({
     type: 'object',
@@ -489,6 +522,150 @@ test('tool schema compaction preserves literal const, enum, and default values',
       choice: { const: literals.properties.choice.const },
     },
   });
+});
+
+test('delta prompt sends only the new tail once the remote chat is in sync', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote-1';
+  session.messageCount = 4;
+  session.history.push({ user: 'q1', assistant: 'a1' });
+  session.history.push({ user: 'q2', assistant: 'final answer' });
+
+  const messages = [
+    { role: 'user', content: 'q1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2' },
+    { role: 'assistant', content: 'final answer' },
+    { role: 'user', content: 'next question' },
+  ];
+  const delta = serverInternals.selectDeltaMessages(messages, session);
+  assert.deepEqual(delta, [{ role: 'user', content: 'next question' }]);
+  assert.equal(serverInternals.formatMessages(delta, []).prompt, 'User: next question');
+});
+
+test('delta prompt falls back to the full transcript on any divergence', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote-1';
+  session.history.push({ user: 'q2', assistant: 'final answer' });
+
+  // No remote session yet — nothing to continue.
+  const noSession = serverInternals.createSession();
+  assert.equal(serverInternals.selectDeltaMessages([{ role: 'user', content: 'q' }], noSession), null);
+
+  // Empty history — cannot prove sync.
+  const emptyHistory = serverInternals.createSession();
+  emptyHistory.id = 'remote-1';
+  assert.equal(serverInternals.selectDeltaMessages([{ role: 'user', content: 'q' }], emptyHistory), null);
+
+  // Last assistant turn differs (client edited/compacted it) — full transcript.
+  const diverged = [
+    { role: 'assistant', content: 'final answer' },
+    { role: 'user', content: 'next' },
+    { role: 'assistant', content: 'some other reply' },
+    { role: 'user', content: 'newest' },
+  ];
+  assert.equal(serverInternals.selectDeltaMessages(diverged, session), null);
+
+  // Matching turn but no new user/tool input after it — full transcript.
+  const noNewInput = [
+    { role: 'user', content: 'q2' },
+    { role: 'assistant', content: 'final answer' },
+  ];
+  assert.equal(serverInternals.selectDeltaMessages(noNewInput, session), null);
+
+  // Client history without any assistant turn at all — full transcript.
+  assert.equal(serverInternals.selectDeltaMessages([{ role: 'user', content: 'q2' }], session), null);
+});
+
+test('delta prompt matches tool-call assistant turns and carries tool results', () => {
+  const session = serverInternals.createSession();
+  session.id = 'remote-1';
+  session.history.push({
+    user: 'read the file',
+    assistant: 'TOOL_CALL: read_file\narguments: {"path":"a.txt"}',
+  });
+
+  const messages = [
+    { role: 'user', content: 'read the file' },
+    {
+      role: 'assistant',
+      tool_calls: [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }],
+    },
+    { role: 'tool', content: 'file body' },
+  ];
+  const delta = serverInternals.selectDeltaMessages(messages, session);
+  assert.deepEqual(delta, [{ role: 'tool', content: 'file body' }]);
+  assert.match(serverInternals.formatMessages(delta, []).prompt, /\[Tool Result\]/);
+
+  assert.equal(
+    serverInternals.serializeAssistantTurn(messages[1]),
+    'TOOL_CALL: read_file\narguments: {"path":"a.txt"}',
+  );
+  assert.equal(serverInternals.serializeAssistantTurn({ role: 'user', content: 'x' }), null);
+});
+
+test('recovery buffer and timeouts stay small and generous by default', () => {
+  assert.equal(serverInternals.MAX_HISTORY_LENGTH, 3);
+  assert.equal(serverInternals.MAX_HISTORY_CHARS, 2000);
+  assert.equal(serverInternals.DS_FETCH_TIMEOUT_MS, 180000);
+  assert.equal(serverInternals.REQUEST_DEADLINE_MS, 300000);
+});
+
+test('stream-level "sending too often" notices are recognised in every locale', () => {
+  assert.equal(serverInternals.isRateLimitMessage({ content: '请求过于频繁，请稍后再试' }), true);
+  assert.equal(serverInternals.isRateLimitMessage({ content: 'You are sending messages too often' }), true);
+  assert.equal(serverInternals.isRateLimitMessage({ content: 'rate limit exceeded' }), true);
+  assert.equal(serverInternals.isRateLimitMessage({ content: 'Слишком часто повторяется запрос' }), true);
+  assert.equal(serverInternals.isRateLimitMessage({ content: 'Maximum context length exceeded' }), false);
+  assert.equal(serverInternals.isRateLimitMessage({ content: 'Temporary backend overload' }), false);
+  assert.equal(serverInternals.isRateLimitMessage(null), false);
+
+  assert.deepEqual(
+    serverInternals.classifyRecoveryFailure({ content: '请求过于频繁' }, false),
+    { status: 429, type: 'rate_limit_error' },
+  );
+});
+
+test('stream rate limit cools the account down with escalating backoff', () => {
+  const account = { id: 'rl', cooldownUntil: 0, failures: 0, rateLimitStreak: 0 };
+  const baseSec = Math.ceil(serverInternals.RATE_LIMIT_COOLDOWN_MS / 1000);
+  const first = serverInternals.markRateLimited(account, 'too often');
+  assert.equal(first, baseSec);
+  assert.ok(account.cooldownUntil > Date.now());
+  assert.equal(account.rateLimitStreak, 1);
+
+  const second = serverInternals.markRateLimited(account, 'too often');
+  assert.equal(second, baseSec * 2);
+  assert.equal(account.rateLimitStreak, 2);
+
+  // Escalation is capped by the 10-minute account cooldown, never beyond it.
+  account.rateLimitStreak = 20;
+  const capped = serverInternals.markRateLimited(account, 'too often');
+  assert.equal(capped, 600);
+  assert.ok(account.cooldownUntil - Date.now() <= 10 * 60 * 1000);
+});
+
+test('a new chat starts from a smaller prompt budget than a live one', () => {
+  assert.equal(serverInternals.FRESH_SESSION_PROMPT_CHARS, 24000);
+  const big = `TASK\n${'x'.repeat(120000)}\nTAIL`;
+  const fresh = serverInternals.buildBoundedPrompt('sys', '', big, serverInternals.FRESH_SESSION_PROMPT_CHARS);
+  assert.equal(fresh.compacted, true);
+  assert.ok(fresh.prompt.length <= 24000);
+  assert.match(fresh.prompt, /TASK/);
+  assert.match(fresh.prompt, /TAIL/);
+});
+
+test('upstream call pacing keeps a gap between the calls of one logical turn', async () => {
+  const account = { id: 'gap', lastUpstreamCallAt: 0 };
+  assert.equal(await serverInternals.paceUpstreamCall(account, 0), 0);
+
+  const gapMs = 60;
+  await serverInternals.paceUpstreamCall(account, gapMs);
+  const startedAt = Date.now();
+  const waited = await serverInternals.paceUpstreamCall(account, gapMs);
+  assert.ok(waited >= gapMs - 10, `expected ~${gapMs}ms between upstream calls, got ${waited}ms`);
+  assert.ok(Date.now() - startedAt >= gapMs - 10);
+  assert.equal(serverInternals.UPSTREAM_CALL_GAP_MS, 700);
 });
 
 test('buildBoundedPrompt preserves task edges and drops duplicate recovery history', () => {
@@ -590,7 +767,7 @@ test('remote reset preserves local history and sticky account while returning fa
   assert.equal(session.history.length, 1);
 });
 
-test('account rotation clears a foreign remote session and preserves local recovery history', (t) => {
+test('short sticky cooldown waits it out and preserves the remote session', async (t) => {
   const originalAccounts = serverInternals.accounts.splice(0);
   t.after(() => {
     serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
@@ -600,30 +777,138 @@ test('account rotation clears a foreign remote session and preserves local recov
     {
       id: 'cooling',
       config: { token: 'one', cookie: 'one' },
-      cooldownUntil: Date.now() + 60_000,
+      cooldownUntil: Date.now() + 40,
       headers: {},
+      nextSlotAt: 0,
     },
     {
       id: 'ready',
       config: { token: 'two', cookie: 'two' },
       cooldownUntil: 0,
       headers: {},
+      nextSlotAt: 0,
+    },
+  );
+  const session = serverInternals.createSession();
+  session.id = 'sticky-session';
+  session.parentMessageId = 'sticky-parent';
+  session.accountId = 'cooling';
+  session.messageCount = 7;
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  const selected = await serverInternals.selectAccountForSession(session);
+  assert.equal(selected.id, 'cooling');
+  assert.equal(session.accountId, 'cooling');
+  assert.equal(session.id, 'sticky-session');
+  assert.equal(session.parentMessageId, 'sticky-parent');
+  assert.equal(session.messageCount, 7);
+  assert.equal(session.history.length, 1);
+});
+
+test('long sticky cooldown returns 429 without resetting the session', async (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+  });
+
+  serverInternals.accounts.push(
+    {
+      id: 'cooling-long',
+      config: { token: 'one', cookie: 'one' },
+      cooldownUntil: Date.now() + serverInternals.STICKY_WAIT_MS + 60_000,
+      headers: {},
+      nextSlotAt: 0,
+    },
+    {
+      id: 'ready',
+      config: { token: 'two', cookie: 'two' },
+      cooldownUntil: 0,
+      headers: {},
+      nextSlotAt: 0,
+    },
+  );
+  const session = serverInternals.createSession();
+  session.id = 'sticky-session';
+  session.parentMessageId = 'sticky-parent';
+  session.accountId = 'cooling-long';
+  session.messageCount = 7;
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  await assert.rejects(
+    () => serverInternals.selectAccountForSession(session),
+    (err) => err.status === 429 && err.type === 'rate_limit' && err.retryAfter > 0,
+  );
+  assert.equal(session.id, 'sticky-session');
+  assert.equal(session.parentMessageId, 'sticky-parent');
+  assert.equal(session.accountId, 'cooling-long');
+  assert.equal(session.history.length, 1);
+});
+
+test('account rotation clears a foreign remote session only when the sticky account is gone', async (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+  });
+
+  // Sticky account vanished from the pool entirely (not merely cooling down).
+  serverInternals.accounts.push(
+    {
+      id: 'ready',
+      config: { token: 'two', cookie: 'two' },
+      cooldownUntil: 0,
+      headers: {},
+      nextSlotAt: 0,
     },
   );
   const session = serverInternals.createSession();
   session.id = 'foreign-session';
   session.parentMessageId = 'foreign-parent';
-  session.accountId = 'cooling';
+  session.accountId = 'missing';
   session.messageCount = 7;
   session.history.push({ user: 'old task', assistant: 'old answer' });
 
-  const selected = serverInternals.selectAccountForSession(session);
+  const selected = await serverInternals.selectAccountForSession(session);
   assert.equal(selected.id, 'ready');
   assert.equal(session.accountId, 'ready');
   assert.equal(session.id, null);
   assert.equal(session.parentMessageId, null);
   assert.equal(session.messageCount, 0);
   assert.equal(session.history.length, 1);
+});
+
+test('upstream pacing spaces consecutive slots on the same account', async () => {
+  const account = { id: 'paced', nextSlotAt: 0 };
+  const intervalMs = 80;
+
+  const first = await serverInternals.acquireAccountSlot(account, intervalMs, 0);
+  assert.equal(first, 0);
+  assert.ok(account.nextSlotAt > Date.now() - intervalMs);
+
+  const startedAt = Date.now();
+  const second = await serverInternals.acquireAccountSlot(account, intervalMs, 0);
+  const elapsed = Date.now() - startedAt;
+  assert.ok(second >= intervalMs - 10, `expected ~${intervalMs}ms wait, got ${second}ms`);
+  assert.ok(elapsed >= intervalMs - 10, `expected elapsed >= ${intervalMs}ms, got ${elapsed}ms`);
+
+  const disabled = await serverInternals.acquireAccountSlot({ id: 'off', nextSlotAt: 0 }, 0);
+  assert.equal(disabled, 0);
+});
+
+test('upstream pacing jitter only ever lengthens the gap', async () => {
+  const account = { id: 'jittered', nextSlotAt: 0 };
+  await serverInternals.acquireAccountSlot(account, 60, 0);
+  const gapBefore = account.nextSlotAt - Date.now();
+
+  for (let i = 0; i < 5; i++) {
+    const wait = await serverInternals.acquireAccountSlot(account, 60, 400);
+    assert.ok(wait >= 60 - 10, `jitter shortened the wait to ${wait}ms`);
+    assert.ok(account.nextSlotAt - Date.now() >= gapBefore - 10, 'jitter must not shrink the reserved gap');
+  }
+});
+
+test('default upstream pacing leaves a wide, jittered gap', () => {
+  assert.equal(serverInternals.MIN_REQUEST_INTERVAL_MS, 5000);
+  assert.equal(serverInternals.REQUEST_JITTER_MS, 2000);
 });
 
 test('cross-account continuation is accepted only with a fresh recovery prompt', () => {
@@ -644,7 +929,7 @@ test('cross-account continuation is accepted only with a fresh recovery prompt',
 test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
   const depthSession = serverInternals.createSession();
   depthSession.id = 'deep-session';
-  depthSession.messageCount = 100;
+  depthSession.messageCount = serverInternals.MAX_MESSAGE_DEPTH;
   depthSession.accountId = 'account_1';
   depthSession.history.push({ user: 'u', assistant: 'a' });
   const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now());
@@ -656,10 +941,15 @@ test('TTL and depth rollover happens before prompt construction and preserves re
   const now = Date.now();
   const ttlSession = serverInternals.createSession();
   ttlSession.id = 'old-session';
-  ttlSession.createdAt = now - (2 * 60 * 60 * 1000) - 1;
+  ttlSession.createdAt = now - serverInternals.SESSION_TTL_MS - 1;
   const ttlReset = serverInternals.prepareSessionForPrompt(ttlSession, now);
   assert.equal(ttlReset.reason, 'session_ttl');
   assert.equal(ttlReset.failedSessionId, 'old-session');
+
+  const freshTtlSession = serverInternals.createSession();
+  freshTtlSession.id = 'recent-session';
+  freshTtlSession.createdAt = now - Math.floor(serverInternals.SESSION_TTL_MS / 2);
+  assert.equal(serverInternals.prepareSessionForPrompt(freshTtlSession, now), null);
 });
 
 test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {

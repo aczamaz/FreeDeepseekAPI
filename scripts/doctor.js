@@ -2,8 +2,10 @@
 const fs = require('fs');
 const path = require('path');
 
+const authConfig = require('../lib/auth_config');
+
 const ROOT = path.resolve(__dirname, '..');
-const DEFAULT_AUTH = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
+const DEFAULT_AUTH = process.env.DEEPSEEK_AUTH_PATH || authConfig.defaultAuthPath();
 
 function isTruthy(v) { return /^(1|true|yes|on)$/i.test(String(v || '')); }
 function argHas(args, ...names) { return args.some(a => names.includes(a)); }
@@ -14,9 +16,15 @@ function authPaths() {
       .sort()
       .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
   }
-  if (process.env.DEEPSEEK_AUTH_PATH && process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
-    return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+  if (process.env.DEEPSEEK_AUTH_PATH) {
+    if (process.env.DEEPSEEK_AUTH_PATH.includes(',')) {
+      return process.env.DEEPSEEK_AUTH_PATH.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    return [DEFAULT_AUTH];
   }
+  // Mirror the server: an existing data/accounts pool is the default source.
+  const pool = authConfig.accountFiles();
+  if (pool.length > 0) return pool;
   return [DEFAULT_AUTH];
 }
 function checkAuthFile(file) {
@@ -65,7 +73,9 @@ async function liveCheck(auth) {
 async function main(args = process.argv.slice(2)) {
   const offline = argHas(args, '--offline') || isTruthy(process.env.DOCTOR_OFFLINE);
   console.log('FreeDeepseekAPI doctor');
-  console.log(`Auth source: ${process.env.DEEPSEEK_AUTH_DIR ? 'DEEPSEEK_AUTH_DIR' : 'DEEPSEEK_AUTH_PATH/default'}`);
+  const source = process.env.DEEPSEEK_AUTH_DIR ? 'DEEPSEEK_AUTH_DIR'
+    : (authConfig.hasAccountFiles() ? 'data/accounts (default pool)' : 'DEEPSEEK_AUTH_PATH/default');
+  console.log(`Auth source: ${source}`);
   const results = authPaths().map(checkAuthFile);
   let ok = true;
   for (const r of results) {

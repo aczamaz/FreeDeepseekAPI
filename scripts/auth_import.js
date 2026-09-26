@@ -3,10 +3,12 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+const authConfig = require('../lib/auth_config');
+
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_WASM = 'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
 const envAuthPath = process.env.DEEPSEEK_AUTH_PATH || '';
-const DEFAULT_OUT = envAuthPath && !envAuthPath.includes(',') ? envAuthPath : path.join(ROOT, 'deepseek-auth.json');
+const DEFAULT_OUT = envAuthPath && !envAuthPath.includes(',') ? envAuthPath : authConfig.defaultAuthPath();
 
 function argValue(args, ...names) {
   for (let i = 0; i < args.length; i++) {

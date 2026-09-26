@@ -29,7 +29,7 @@ const profileDir =
 // Use a dedicated default port so an older normal-Chrome auth window on 9333 is not reused.
 const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9334);
 const outPath =
-    process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json');
+    process.env.DEEPSEEK_AUTH_PATH || require('../lib/auth_config').defaultAuthPath();
 const url = 'https://chat.deepseek.com/';
 const reuseChrome = /^(1|true|yes|on)$/i.test(
     process.env.DEEPSEEK_REUSE_CHROME || '',

@@ -311,7 +311,7 @@ npm run doctor -- --offline
 
 `doctor` проверяет:
 
-- найден ли `deepseek-auth.json` / `DEEPSEEK_AUTH_DIR`;
+- найден ли пул `data/accounts/*.json` / `DEEPSEEK_AUTH_DIR` / `deepseek-auth.json`;
 - валидный ли JSON;
 - есть ли `token`, `cookie`, `wasmUrl`;
 - безопасные ли права файла на macOS/Linux (`0600`);
@@ -362,23 +362,41 @@ curl -X POST "http://localhost:9655/reset-session?agent=all"
 
 Почему чаты всё равно появляются в DeepSeek Web: proxy работает через внутренний Web Chat API, а DeepSeek хранит реальные chat sessions у себя. Это нормально для web-proxy. Задача session reuse — не плодить новые чаты без необходимости и аккуратно сбрасываться только когда chain протух/сломался.
 
+Что делает proxy, чтобы чат жил максимально долго:
+
+- **delta-промпты**: пока удалённый чат жив, отправляется только новая часть переписки, а не вся история заново (иначе контекст в облаке рос квадратично и чат умирал на 17-34 сообщениях). При любом расхождении — fallback на полную переписку, recovery-пути тоже всегда используют полную переписку;
+- **таймаут не убивает чат**: истёкший бюджет времени не означает мёртвую сессию;
+- **«слишком частые сообщения» лечатся**: DeepSeek часто отдаёт эту ошибку не как 429, а как текст ошибки внутри 200-ответа. Proxy её распознаёт (EN/RU/ZH), **охлаждает аккаунт** с нарастающей паузой (60с → 120с → …, потолок — cooldown аккаунта), **не трогает чат** и отдаёт клиенту `429` + `Retry-After`. Успешный ответ сбрасывает счётчик. Отдельные вызовы внутри одного хода (PoW, создание чата, completion) разнесены паузой `DEEPSEEK_UPSTREAM_CALL_GAP_MS`;
+- **пустой ответ** сначала повторяется на том же чате, и только второй провал пересоздаёт сессию;
+- **ремонт битой tool-разметки** тоже не пересоздаёт чат;
+- **recovery-буфер маленький** (3 обмена / 2000 символов) — реальный контекст живёт в облаке DeepSeek, агент может перечитать нужное через tools. Настраивается `DEEPSEEK_MAX_HISTORY_LENGTH` / `DEEPSEEK_MAX_HISTORY_CHARS`.
+
 ---
 
 ## 👥 Multi-account pool
 
-Можно подключить несколько auth-файлов. Правильная модель: sticky account per agent/session — proxy не переключает аккаунт внутри живой DeepSeek-сессии. Если аккаунт получил `401/403/429` и ушёл в cooldown, session безопасно сбрасывается и новый запрос может перейти на другой доступный аккаунт.
+Можно подключить несколько auth-файлов. Правильная модель: sticky account per agent/session — proxy не переключает аккаунт внутри живой DeepSeek-сессии. Если аккаунт получил `401/403/429` и ушёл в cooldown, чат **не сбрасывается**: proxy ждёт выхода из cooldown (до `DEEPSEEK_STICKY_WAIT_MS`, дефолт 60с) либо отвечает `429` + `Retry-After`, чтобы клиент повторил позже на том же чате. Ротация на другой аккаунт (и сброс remote-сессии) происходит только если аккаунт пропал из пуля или потерял credentials.
 
-Вариант 1 — директория с auth-файлами:
+Вариант 1 — пул в `data/accounts/` (дефолт, env не нужен):
 
 ```bash
-mkdir -p accounts
-cp deepseek-auth-main.json accounts/main.json
-cp deepseek-auth-backup.json accounts/backup.json
-chmod 600 accounts/*.json
-DEEPSEEK_AUTH_DIR=./accounts NON_INTERACTIVE=1 npm start
+mkdir -p data/accounts
+chmod 700 data/accounts
+mv deepseek-auth.json data/accounts/main.json
+cp deepseek-auth-backup.json data/accounts/second.json
+chmod 600 data/accounts/*.json
+npm start
 ```
 
-Вариант 2 — список файлов:
+Каждый `data/accounts/*.json` = отдельный аккаунт. Скрипты авторизации пишут в тот же пул: `npm run auth` обновляет `data/accounts/main.json`, поэтому `npm run auth:import` / `npm run doctor` видят ровно те же файлы, что и сервер. Директория `data/accounts/` уже в `.gitignore` — токены не утекут в git (не используй `accounts/` в корне, он не игнорится).
+
+Вариант 2 — произвольная директория через env:
+
+```bash
+DEEPSEEK_AUTH_DIR=/etc/deepseek-accounts NON_INTERACTIVE=1 npm start
+```
+
+Вариант 3 — список файлов:
 
 ```bash
 DEEPSEEK_AUTH_PATH="./accounts/main.json,./accounts/backup.json" NON_INTERACTIVE=1 npm start
@@ -389,14 +407,15 @@ DEEPSEEK_AUTH_PATH="./accounts/main.json,./accounts/backup.json" NON_INTERACTIVE
 - новый agent/session получает доступный аккаунт round-robin;
 - выбранный аккаунт закрепляется за session (`sticky`);
 - при `401`, `403`, `429` аккаунт уходит в cooldown;
-- если sticky-аккаунт session ушёл в cooldown, старая DeepSeek-сессия сбрасывается, чтобы не долбить rate-limited/expired аккаунт;
+- если sticky-аккаунт session ушёл в cooldown — ждём его до `DEEPSEEK_STICKY_WAIT_MS` или отдаём `429` + `Retry-After`; **сессия не сбрасывается**, новый чат не создаётся;
+- upstream-запросы на аккаунт разряжаются паузой `DEEPSEEK_MIN_REQUEST_INTERVAL_MS` (дефолт 5 сек) + случайный джиттер `DEEPSEEK_REQUEST_JITTER_MS` (0-2000 мс), чтобы реже ловить `429`;
 - статус аккаунтов виден в `/health` без путей к auth-файлам и без имён файлов;
 - auth-файлы должны храниться с правами `0600`.
 
-Настроить cooldown:
+Настроить cooldown и pacing:
 
 ```bash
-DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
+DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 DEEPSEEK_MIN_REQUEST_INTERVAL_MS=5000 npm start
 ```
 
 ---

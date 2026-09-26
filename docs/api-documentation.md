@@ -441,7 +441,7 @@ The proxy uses `user` from the request body. If not set, it falls back to the cl
   parentMessageId: <int|null>,   // Last message ID for threading
   createdAt: <timestamp>,        // Session creation time
   messageCount: 0-100,           // Messages in this session
-  history: [                     // Last 15 exchanges for context recovery
+  history: [                     // Last 3 exchanges (recovery buffer, capped at 2000 chars)
     { user: "...", assistant: "..." }
   ]
 }
@@ -505,7 +505,7 @@ The parser traverses character by character tracking brace depth:
 
 - **Unreliable generation** — DeepSeek Web sometimes forgets the format, adds extra text, or returns malformed JSON
 - **No native tool support** — unlike the official API which has structured tool calls
-- **Session drops** — empty responses at ~17-34 messages require session reset
+- **Session drops** — mitigated by delta prompts (only new messages are sent) plus a same-session retry before any reset
 
 ---
 
@@ -515,15 +515,22 @@ The parser traverses character by character tracking brace depth:
 
 | Condition | Action |
 |---|---|
-| Message count >= 100 | Auto-reset DeepSeek session, keep history buffer |
-| Session age > 2 hours | Auto-reset (DeepSeek web session TTL) |
-| HTTP 400/404/500 response | Reset and retry once |
-| Empty content response | Compact context, reset session, retry up to `DEEPSEEK_MAX_RETRIES` (default 2) |
+| Message count >= `DEEPSEEK_MAX_MESSAGE_DEPTH` (default 100) | Auto-reset DeepSeek session, keep history buffer |
+| Session age > `DEEPSEEK_SESSION_TTL_MS` (default 6 hours) | Auto-reset (configurable; recovery history covers upstream TTL) |
+| HTTP 400/404/500 response | Reset and retry once (chat is genuinely dead) |
+| Empty content response | Retry once on the **same** chat with a smaller prompt; only a second empty response resets the session (`DEEPSEEK_MAX_RETRIES`, default 2) |
+| Request timeout | **Session kept** — only the local wall-clock budget expired; the remote chat stays valid |
 | Context/content too long | Pre-compact to `DEEPSEEK_MAX_PROMPT_CHARS`, then retry with a smaller budget |
+| Malformed tool-call markup | One repair retry on the **same** session with a strict format instruction; if that also fails → `502 malformed_tool_call`, remote chat **reset** (local history and sticky account kept) and the raw model output saved to `$TMPDIR/deepseek_response_*`, so the client's next request starts a clean chat instead of replaying the same failure |
+| Sticky account cooling down after 429 | Wait up to `DEEPSEEK_STICKY_WAIT_MS` (default 60s), else 429 + Retry-After — session is **not** reset |
+| Same-account request bursts | Paced by `DEEPSEEK_MIN_REQUEST_INTERVAL_MS` (default 5000ms) plus `DEEPSEEK_REQUEST_JITTER_MS` (default 0-2000ms) to reduce 429s |
+| Calls inside one turn (PoW, session create, completion) | Separated by `DEEPSEEK_UPSTREAM_CALL_GAP_MS` (default 700ms) |
+| "Sending too often" as a stream error inside HTTP 200 | Account cooled down (`DEEPSEEK_RATE_LIMIT_COOLDOWN_MS`, default 5 min, doubling per repeat, capped by `DEEPSEEK_ACCOUNT_COOLDOWN_MS`); session **preserved**; client gets 429 + `Retry-After`. Add a second auth file to the default `data/accounts/` pool (`npm run auth`) or wait it out — this notice is an account-level throttle |
+| Oversized first message on a new chat | New sessions use `DEEPSEEK_FRESH_SESSION_PROMPT_CHARS` (default 24000) instead of the live-session budget |
 
 ### 6.2 History Buffer
 
-When a session is reset, the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history:
+When a session is reset, the proxy preserves the **last 3 exchanges** (capped at 2,000 chars; `DEEPSEEK_MAX_HISTORY_LENGTH` / `DEEPSEEK_MAX_HISTORY_CHARS`). It injects this recovery context only when the client did not already send multi-turn history. The remote DeepSeek chat is the primary context — the buffer is intentionally small because an agent can re-read what it needs through tools.
 
 ```
 [Previous conversation]
@@ -539,7 +546,13 @@ arguments: {"command": "cat /etc/openvpn/server.conf"}
 <new user prompt>
 ```
 
-### 6.3 Session Recovery
+### 6.3 Delta Prompts (long-lived chats)
+
+While a remote chat is alive, the proxy sends **only the new tail** of the conversation instead of replaying the whole transcript. The tail is used only when the client's last assistant turn matches the proxy's last stored reply (`session.history`, including the `TOOL_CALL: name\narguments: ...` form). Any divergence — edited text, missing turn, no new user/tool input, or a missing remote session — falls back to the full transcript, so context is never silently lost.
+
+This keeps the remote context growing **linearly** instead of quadratically, which is what previously killed long-lived chats after ~17-34 messages. The full transcript is still used for every recovery/recreate path, so a recreated chat is rebuilt with complete context.
+
+### 6.4 Session Recovery
 
 If DeepSeek's web session expires (HTTP 400/404/500):
 1. Current session ID is cleared
@@ -555,11 +568,18 @@ If DeepSeek's web session expires (HTTP 400/404/500):
 ### 7.1 Proxy Configuration (in deepseek-api-server.js)
 
 ```javascript
-const MAX_HISTORY_LENGTH = 15;    // Keep last 15 exchanges
-const MAX_HISTORY_CHARS = 10000;  // Max chars for history buffer
-const MAX_MESSAGE_DEPTH = 100;    // Auto-reset after 100 messages
+const MAX_HISTORY_LENGTH = Number(process.env.DEEPSEEK_MAX_HISTORY_LENGTH || 3);
+const MAX_HISTORY_CHARS = Number(process.env.DEEPSEEK_MAX_HISTORY_CHARS || 2000); // recovery buffer only
+const MAX_MESSAGE_DEPTH = Number(process.env.DEEPSEEK_MAX_MESSAGE_DEPTH || 100);
 const MAX_UPSTREAM_PROMPT_CHARS = 80000; // Configurable via DEEPSEEK_MAX_PROMPT_CHARS
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+const SESSION_TTL_MS = Number(process.env.DEEPSEEK_SESSION_TTL_MS || 6 * 60 * 60 * 1000); // 6 hours
+const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 180000);
+const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 300000);
+const MIN_REQUEST_INTERVAL_MS = Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 5000); // pacing
+const REQUEST_JITTER_MS = Number(process.env.DEEPSEEK_REQUEST_JITTER_MS ?? 2000); // anti-burst spread
+const UPSTREAM_CALL_GAP_MS = Number(process.env.DEEPSEEK_UPSTREAM_CALL_GAP_MS ?? 700);
+const RATE_LIMIT_COOLDOWN_MS = Number(process.env.DEEPSEEK_RATE_LIMIT_COOLDOWN_MS || 60000);
+const STICKY_WAIT_MS = Number(process.env.DEEPSEEK_STICKY_WAIT_MS ?? 60000); // wait for cooling sticky account
 
 const DS_CONFIG = {
   token: "...",                     // DeepSeek auth token
@@ -626,6 +646,7 @@ curl -s http://127.0.0.1:9654/v1/chat/completions \
 | 404 | Not found | Invalid endpoint |
 | 500 | server_error | Internal proxy error (exception) |
 | 502 | empty_response | DeepSeek returned empty content |
+| 502 | malformed_tool_call | Tool-call markup could not be parsed; the remote chat was reset and the request can be retried |
 
 Error response format:
 ```json
@@ -647,10 +668,10 @@ Error response format:
 
 | Issue | Cause | Impact |
 |---|---|---|
-| Empty responses at msg 17-34 | DeepSeek web session instability | Conversation interrupted, retry needed |
+| Empty responses | DeepSeek web session instability (was msg 17-34) | Now retried on the same chat first; only a second failure resets |
 | No native tool calling | DeepSeek Web API doesn't support it | LLM may generate malformed tool calls |
 | Response time 3-17s | PoW + network to DeepSeek | Slower than official API |
-| Session TTL ~2h | DeepSeek web browser timeout | Periodic session resets |
+| Session TTL ~2h upstream | DeepSeek web browser timeout | Client default is 6h (`DEEPSEEK_SESSION_TTL_MS`); if upstream drops earlier, recovery history covers the reset |
 | Credentials expire | Browser tokens/cookies change | Proxy needs re-auth |
 | Same DeepSeek account | All agents share one web login | Rate limiting across all sessions |
 
