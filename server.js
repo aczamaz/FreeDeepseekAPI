@@ -141,6 +141,9 @@ function markContextCompacted(res) {
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
+// Fingerprint-derived ids get announced once so a new chat is visible in the log
+// without repeating the notice on every turn of that chat.
+const announcedConversations = new Map();
 // Recovery buffer: replayed only when a remote chat is missing, so the remote
 // session is the primary context. Kept small on purpose — an agent can re-read
 // what it needs through tools, and a big buffer bloats every fresh prompt.
@@ -438,6 +441,7 @@ function getOrCreateAgentSession(agentId) {
     }
     const session = sessions.get(agentId);
     session.lastActivityAt = Date.now();
+    scheduleSessionPersist();
     return session;
 }
 
@@ -449,8 +453,99 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
     for (const [agentId, session] of sessions) {
         if (now - (session.lastActivityAt || 0) > maxIdleMs) { sessions.delete(agentId); removed++; }
     }
-    if (removed) console.log(`[DS-API] swept ${removed} idle session(s); ${sessions.size} remain`);
+    if (removed) {
+        console.log(`[DS-API] swept ${removed} idle session(s); ${sessions.size} remain`);
+        scheduleSessionPersist();
+    }
     return removed;
+}
+
+// === Session persistence ===
+// The remote chat id is the expensive part of a session: it keeps DeepSeek's own
+// context alive, which is what makes delta prompts possible at all. Keeping it in
+// RAM only meant every restart silently started a brand-new chat and re-sent the
+// whole transcript. Persisting the map (never auth material) lets a restarted
+// proxy pick the same conversation back up.
+const SESSION_PERSIST_ENABLED = /^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_PERSIST_SESSIONS ?? '')) ? false : true;
+const SESSIONS_FILE = process.env.DEEPSEEK_SESSIONS_FILE || path.join(__dirname, 'data', 'sessions.json');
+const SESSION_PERSIST_DEBOUNCE_MS = 500;
+let sessionPersistTimer = null;
+
+function serializeSession(session) {
+    return {
+        id: session.id || null,
+        parentMessageId: session.parentMessageId ?? null,
+        createdAt: session.createdAt || null,
+        messageCount: Number(session.messageCount) || 0,
+        accountId: session.accountId || null,
+        history: Array.isArray(session.history) ? session.history : [],
+        lastActivityAt: session.lastActivityAt || Date.now(),
+    };
+}
+
+function persistSessions() {
+    sessionPersistTimer = null;
+    if (!SESSION_PERSIST_ENABLED) return;
+    try {
+        const payload = { version: 1, savedAt: Date.now(), sessions: [...sessions.entries()].map(([agentId, s]) => [agentId, serializeSession(s)]) };
+        fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+        const tmp = `${SESSIONS_FILE}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+        // Atomic swap: a crash mid-write must not leave a truncated session file
+        // that would strand every remote chat on the next boot.
+        fs.renameSync(tmp, SESSIONS_FILE);
+    } catch (e) {
+        console.log(`[DS-API] Could not persist sessions: ${e.message}`);
+    }
+}
+
+function scheduleSessionPersist() {
+    if (!SESSION_PERSIST_ENABLED || sessionPersistTimer) return;
+    sessionPersistTimer = setTimeout(persistSessions, SESSION_PERSIST_DEBOUNCE_MS);
+    if (typeof sessionPersistTimer.unref === 'function') sessionPersistTimer.unref();
+}
+
+function loadPersistedSessions(file = SESSIONS_FILE) {
+    if (!SESSION_PERSIST_ENABLED) return 0;
+    let raw;
+    try {
+        raw = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+        if (e.code !== 'ENOENT') console.log(`[DS-API] Could not read ${file}: ${e.message}`);
+        return 0;
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (e) {
+        console.log(`[DS-API] Ignoring corrupt session file ${file}: ${e.message}`);
+        return 0;
+    }
+    const entries = Array.isArray(parsed && parsed.sessions) ? parsed.sessions : [];
+    const now = Date.now();
+    let restored = 0;
+    let skipped = 0;
+    for (const entry of entries) {
+        if (!Array.isArray(entry) || !entry[0] || !entry[1] || typeof entry[1] !== 'object') continue;
+        const [agentId, saved] = entry;
+        // A session past its TTL is a dead remote chat; restoring it would only
+        // resurrect an id DeepSeek has likely dropped.
+        if (now - (Number(saved.lastActivityAt) || 0) > SESSION_TTL_MS) { skipped++; continue; }
+        const fresh = createSession();
+        fresh.id = saved.id ?? null;
+        fresh.parentMessageId = saved.parentMessageId ?? null;
+        fresh.createdAt = saved.createdAt ?? null;
+        fresh.messageCount = Number(saved.messageCount) || 0;
+        fresh.accountId = saved.accountId ?? null;
+        fresh.history = Array.isArray(saved.history) ? saved.history : [];
+        fresh.lastActivityAt = Number(saved.lastActivityAt) || now;
+        sessions.set(String(agentId), fresh);
+        restored++;
+    }
+    if (restored > 0 || skipped > 0) {
+        console.log(`[DS-API] Restored ${restored} session(s) from ${path.basename(file)}${skipped ? `, skipped ${skipped} expired` : ''}`);
+    }
+    return restored;
 }
 
 // solvePOW() lives in lib/pow (compiled-module cache + WASM-fetch timeout),
@@ -748,7 +843,6 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
                 throw createUpstreamHttpError(resp2.status, errText2, retryAfter2);
             }
             effectivePrompt = freshSessionPrompt;
-            account.rateLimitStreak = 0;
             return { resp: resp2, agentId, account, promptUsed: effectivePrompt, freshSessionReset: true };
         }
         // The body was consumed for diagnostics, so returning this Response
@@ -759,7 +853,11 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
 
     // A completed turn proves the account is healthy again: forget any earlier
     // rate-limit streak so the next escalation restarts from the base cooldown.
-    account.rateLimitStreak = 0;
+    // This must NOT run on the HTTP 200 alone — DeepSeek reports "sending too
+    // often" *inside* a 200 stream, so resetting here would zero the streak
+    // immediately before every stream-level rate limit is counted, pinning the
+    // cooldown at the base value forever. The reset belongs after a non-empty
+    // response, in markAccountHealthy.
     return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
 }
 
@@ -1299,22 +1397,68 @@ function estimateTokens(text) {
     return text ? Math.ceil(String(text).length / 4) : 0;
 }
 
-function buildUsage(prompt, content, reasoningContent = '') {
-    const promptTokens = estimateTokens(prompt);
-    const contentTokens = estimateTokens(content);
-    const reasoningTokens = estimateTokens(reasoningContent);
-    const completionTokens = contentTokens + reasoningTokens;
-    return {
+// DeepSeek Web reports a cumulative `accumulated_token_usage` counter per remote
+// chat, delivered in the final JSON-patch batch. The growth a request causes is
+// real accounting, unlike the chars/4 guess, which is off by an order of
+// magnitude on long agent chats: the live prompt is a two-message delta on top
+// of a large remote chat the estimator never sees.
+//
+// The counter is cumulative and prompt caching means its growth does not split
+// cleanly into input and output, so only the total is treated as exact. The
+// estimated ratio is used to divide that exact total between the two buckets,
+// which keeps `prompt + completion === total` for cost maths in harnesses.
+//
+// `upstream` is { start, total }. Anything missing or non-advancing falls back
+// to the plain estimate.
+function resolveUpstreamUsage(upstream, estimated = {}) {
+    const promptTokens = Math.max(0, Math.floor(Number(estimated.promptTokens) || 0));
+    const completionEstimate = Math.max(0, Math.floor(Number(estimated.completionTokens) || 0));
+    const reasoningEstimate = Math.max(0, Math.floor(Number(estimated.reasoningTokens) || 0));
+    const fallback = () => ({
         prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
+        completion_tokens: completionEstimate,
+        total_tokens: promptTokens + completionEstimate,
+        completion_tokens_details: { reasoning_tokens: Math.min(reasoningEstimate, completionEstimate) },
+        source: 'estimate',
+    });
+
+    const start = Number(upstream && upstream.start);
+    const total = Number(upstream && upstream.total);
+    if (!Number.isFinite(start) || !Number.isFinite(total) || total <= 0) return fallback();
+    const spent = Math.floor(total - start);
+    if (spent <= 0) return fallback();
+
+    const estimatedTotal = promptTokens + completionEstimate;
+    const realPrompt = estimatedTotal > 0
+        ? Math.min(spent, Math.round((spent * promptTokens) / estimatedTotal))
+        : spent;
+    const realCompletion = spent - realPrompt;
+    return {
+        prompt_tokens: realPrompt,
+        completion_tokens: realCompletion,
+        total_tokens: spent,
+        completion_tokens_details: { reasoning_tokens: Math.min(reasoningEstimate, realCompletion) },
+        source: 'upstream',
+    };
+}
+
+function buildUsage(prompt, content, reasoningContent = '', upstream = null) {
+    const resolved = resolveUpstreamUsage(upstream, {
+        promptTokens: estimateTokens(prompt),
+        completionTokens: estimateTokens(content) + estimateTokens(reasoningContent),
+        reasoningTokens: estimateTokens(reasoningContent),
+    });
+    return {
+        prompt_tokens: resolved.prompt_tokens,
+        completion_tokens: resolved.completion_tokens,
+        total_tokens: resolved.total_tokens,
         completion_tokens_details: {
-            reasoning_tokens: reasoningTokens
+            reasoning_tokens: resolved.completion_tokens_details.reasoning_tokens
         }
     };
 }
 
-function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '') {
+function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '', upstreamTokens = null) {
     const id = 'call_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     const message = {
         role: 'assistant',
@@ -1337,12 +1481,12 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
             message,
             finish_reason: 'tool_calls'
         }],
-        usage: buildUsage(prompt, '', reasoningContent),
+        usage: buildUsage(prompt, '', reasoningContent, upstreamTokens),
         watermark: FORGETMEAI_WATERMARK
     };
 }
 
-function buildTextResponse(content, prompt, model = 'deepseek-default', reasoningContent = '', finishReason = null) {
+function buildTextResponse(content, prompt, model = 'deepseek-default', reasoningContent = '', finishReason = null, upstreamTokens = null) {
     const message = { role: 'assistant', content };
     if (reasoningContent) message.reasoning_content = reasoningContent;
     return {
@@ -1357,7 +1501,7 @@ function buildTextResponse(content, prompt, model = 'deepseek-default', reasonin
             // instead of silently treating a cut-off answer as a clean stop.
             finish_reason: finishReason === 'length' ? 'length' : 'stop'
         }],
-        usage: buildUsage(prompt, content, reasoningContent),
+        usage: buildUsage(prompt, content, reasoningContent, upstreamTokens),
         watermark: FORGETMEAI_WATERMARK
     };
 }
@@ -1620,7 +1764,11 @@ function sendResponsesStream(res, openaiResp) {
     res.end();
 }
 
-function sendOpenAIStream(res, openaiResp) {
+// OpenAI-compatible streaming has no usage field on the terminal chunk, so a
+// harness that only ever streams would otherwise see zero cost. Emitting the
+// documented usage-only chunk (empty `choices`) keeps accounting native for
+// streaming clients; those that ignore it are unaffected.
+function sendOpenAIStream(res, openaiResp, includeUsage = true) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     const choice = openaiResp.choices[0];
     const msg = choice.message || {};
@@ -1634,15 +1782,23 @@ function sendOpenAIStream(res, openaiResp) {
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
         }
     }
+    const done = () => {
+        if (includeUsage && openaiResp.usage) {
+            res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: openaiResp.usage })}\n\n`);
+        }
+        res.write('data: [DONE]\n\n');
+    };
     if (hasToolCalls) {
         res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: null, tool_calls: msg.tool_calls }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+        done();
     } else {
         for (let i = 0; i < (msg.content || '').length; i += 50) {
             const chunk = msg.content.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] })}\n\n`);
         }
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+        done();
     }
     res.end();
 }
@@ -1733,6 +1889,74 @@ function buildRecoveryHistoryPrefix(history) {
     return prefix + '[Continue from here]\n\n';
 }
 
+// === Agent / conversation identity ===
+// Harnesses without a per-conversation header (opencode sends none) collapse every
+// project onto one key, so all of a user's chats end up interleaved in a single
+// DeepSeek conversation. The harness does resend the whole transcript on every turn,
+// and the first user message is the one part of it that never changes for the life
+// of a chat: hashing it separates conversations without asking the client to
+// cooperate. A key that does change — an explicit header, a compaction that rewrites
+// the opening turn, a new chat — simply starts a new remote conversation, which is
+// the correct behaviour for what is now a different conversation.
+const AGENT_FINGERPRINT_CHARS = 4000;
+
+function messageText(content) {
+    if (typeof content === 'string') return content;
+    if (content == null) return '';
+    try { return JSON.stringify(content); } catch (e) { return String(content); }
+}
+
+function conversationFingerprint(messages) {
+    const turns = (Array.isArray(messages) ? messages : []).filter(m => m && m.role === 'user');
+    const first = turns[0];
+    if (!first) return '';
+    const seed = messageText(first.content).slice(0, AGENT_FINGERPRINT_CHARS).trim();
+    if (seed.length < 8) return '';
+    return 'conv-' + crypto.createHash('sha256').update(seed).digest('hex').slice(0, 16);
+}
+
+// Which header carries a conversation id. Configurable because harnesses disagree
+// on the name; point this at whichever one the client actually sends.
+const AGENT_HEADER_NAME = String(process.env.DEEPSEEK_AGENT_HEADER || 'x-agent-session').toLowerCase();
+const AGENT_FINGERPRINT_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_AGENT_FINGERPRINT ?? '1'));
+
+function resolveAgentId({ headerValue, paramValue, remoteAddr, messages }) {
+    const header = headerValue ? String(headerValue) : '';
+    if (header) return { agentId: header, source: 'header' };
+    const param = paramValue ? String(paramValue) : '';
+    if (param) return { agentId: param, source: 'param' };
+    const pinned = String(process.env.DEEPSEEK_AGENT_ID || '');
+    if (pinned) return { agentId: pinned, source: 'env' };
+    if (AGENT_FINGERPRINT_ENABLED) {
+        const fingerprint = conversationFingerprint(messages);
+        if (fingerprint) return { agentId: fingerprint, source: 'conversation' };
+    }
+    const isLoopback = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+    return { agentId: isLoopback ? 'dev-agent' : String(remoteAddr || 'unknown'), source: isLoopback ? 'loopback' : 'peer' };
+}
+
+// Added when compaction is severe enough that the task itself may be gone. Without
+// it a model that receives a marker plus a wall of tool output tends to answer with
+// a token or two ("ok") instead of admitting the context is insufficient.
+const PROMPT_COMPACTION_NOTICE = '[CONTEXT NOTE] Earlier turns of this conversation were dropped to fit the upstream limit. Continue from the most recent messages below. If the current task is not clear from what remains, say exactly what you need instead of guessing.\n\n';
+
+// The conversation is serialized as "User: …\n\nAssistant: …\n\n" blocks, so the
+// last task the user asked for is the final "User: " segment. Truncation keeps the
+// tail of the text, which after a long tool loop is all tool output — the request
+// itself would be dropped, leaving the model nothing to act on. Only the request
+// text is returned; everything the assistant and tools said after it is the noise
+// that pushed the task out of the budget in the first place.
+function extractLastUserTurn(conversation) {
+    const value = String(conversation || '');
+    const marker = '\nUser: ';
+    const lastIndex = value.lastIndexOf(marker);
+    const start = lastIndex === -1 ? (value.startsWith('User: ') ? 0 : -1) : lastIndex + 1;
+    if (start === -1) return '';
+    const segment = value.substring(start);
+    const reply = segment.search(/\n+Assistant: /);
+    return (reply === -1 ? segment : segment.substring(0, reply)).trim();
+}
+
 function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
     const system = String(systemPrompt || '').trim();
     const history = String(historyPrefix || '');
@@ -1760,18 +1984,47 @@ function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, max
         systemBudget = Math.max(0, safeMax - separatorLength - conversationBudget);
     }
 
+    // Reserve room for the last user request and the context notice before
+    // handing out the conversation budget, otherwise they could be squeezed out.
+    const lastUserTurn = extractLastUserTurn(currentConversation);
+    const needsTaskRescue = lastUserTurn.length > 0 && truncatePromptMiddle(currentConversation, conversationBudget, 0.25).indexOf(lastUserTurn.substring(0, 200)) === -1;
+    if (needsTaskRescue) {
+        const reserve = Math.min(lastUserTurn.length, Math.floor(safeMax * 0.4));
+        conversationBudget = Math.max(0, conversationBudget - reserve - PROMPT_COMPACTION_NOTICE.length);
+        systemBudget = Math.max(0, safeMax - separatorLength - conversationBudget);
+    }
+
     // Preserve the start of the task/system instructions and the most recent
     // tool loop. The injected tool adapter lives at the end of systemPrompt.
     const boundedSystem = truncatePromptMiddle(system, systemBudget, 0.35);
     const boundedConversation = truncatePromptMiddle(currentConversation, conversationBudget, 0.25);
-    let bounded = boundedSystem && boundedConversation
+    const head = boundedSystem && boundedConversation
         ? `${boundedSystem}\n\n${boundedConversation}`
         : (boundedSystem || boundedConversation);
+
+    // The rescue block is appended last and must never be the thing that gets cut,
+    // so the compacted head absorbs the clamp instead.
+    let rescueBlock = '';
+    if (needsTaskRescue) {
+        const reserve = Math.min(lastUserTurn.length, Math.floor(safeMax * 0.4));
+        rescueBlock = `\n\n${PROMPT_COMPACTION_NOTICE}The task you were working on, preserved verbatim:\n${truncatePromptMiddle(lastUserTurn, reserve, 0.6)}`;
+    }
+    let bounded;
+    if (rescueBlock && head.length + rescueBlock.length > safeMax) {
+        if (rescueBlock.length >= safeMax) {
+            bounded = rescueBlock.substring(rescueBlock.length - safeMax);
+        } else {
+            bounded = head.substring(0, safeMax - rescueBlock.length) + rescueBlock;
+        }
+    } else {
+        bounded = head + rescueBlock;
+    }
     if (bounded.length > safeMax) bounded = bounded.substring(0, safeMax);
     return {
         prompt: bounded,
         compacted: true,
         historyDropped,
+        taskRescued: needsTaskRescue,
         originalChars: original.length,
         promptChars: bounded.length,
     };
@@ -1831,6 +2084,17 @@ function markRateLimited(account, reason = 'stream rate limit') {
     account.cooldownUntil = Date.now() + cooldownMs;
     console.log(`[account:${account.id}] stream rate limit (${reason}); cooldown ${Math.round(cooldownMs / 1000)}s (streak ${account.rateLimitStreak})`);
     return Math.max(1, Math.ceil(cooldownMs / 1000));
+}
+
+// Only a turn that actually produced content counts as proof of health. Called
+// once the stream carried a real answer, never on the HTTP 200 that opened it,
+// so a run of stream-level rate limits keeps escalating to the cap.
+function markAccountHealthy(account) {
+    if (!account) return;
+    if (account.rateLimitStreak || account.failures) {
+        account.rateLimitStreak = 0;
+        account.failures = 0;
+    }
 }
 
 function normalizeRetryResponse(result) {
@@ -1960,7 +2224,7 @@ const server = http.createServer(async (req, res) => {
             in_flight: inFlight,
             accounts: accounts.map(accountStatus),
             config_ready: hasAuthConfig(),
-            session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
+            session_reuse: { strategy: `sticky per ${AGENT_HEADER_NAME}/user, else per-conversation fingerprint`, ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(health));
@@ -2086,12 +2350,31 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
+            // Resolve which conversation this turn belongs to. Without a real id
+            // every local client shares one DeepSeek chat, so a fingerprint of the
+            // opening user message is used instead of collapsing them all together.
             const remoteAddr = req.socket.remoteAddress || 'unknown';
-            const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+            const requestedSession = req.headers[AGENT_HEADER_NAME] || params.session || params.user;
+            // Harnesses differ in what they identify a conversation with. Log what
+            // actually arrives so session isolation can be keyed on a real header
+            // instead of guessing, and so one local client does not silently
+            // collapse every project into a single remote chat.
+            if (/^(1|true|yes|on)$/i.test(String(process.env.DEEPSEEK_DEBUG_SESSION || ''))) {
+                const identity = Object.keys(req.headers)
+                    .filter(h => /session|conversation|chat|user|agent|thread/i.test(h))
+                    .map(h => `${h}=${JSON.stringify(String(req.headers[h]).slice(0, 60))}`);
+                console.log(`[session-debug] identity headers: ${identity.length ? identity.join(' ') : '(none — falling back to conversation fingerprint)'}`);
+            }
+            const { agentId, source: agentIdSource } = resolveAgentId({
+                headerValue: req.headers[AGENT_HEADER_NAME],
+                paramValue: params.session || params.user,
+                remoteAddr,
+                messages,
+            });
+            if (agentIdSource === 'conversation' && !announcedConversations.has(agentId)) {
+                announcedConversations.set(agentId, Date.now());
+                console.log(`[${agentId}] new conversation detected (fingerprint of the opening message); it gets its own DeepSeek chat. Send ${AGENT_HEADER_NAME}: <name> to name it yourself.`);
+            }
             const agentTag = `[${agentId}]`;
             activeAgentId = agentId;
 
@@ -2192,6 +2475,38 @@ const server = http.createServer(async (req, res) => {
                 let newMessageId = null;
                 let finishReason = null;
                 let modelError = null;
+                let tokenUsageStart = null;
+                let tokenUsageTotal = null;
+
+                // Opt-in stream introspection: the upstream protocol is a JSON-patch
+                // stream, so the only reliable way to learn what it reports (token
+                // counts included) is to look at the paths it actually sends.
+                const debugStream = /^(1|true|yes|on)$/i.test(String(process.env.DEEPSEEK_DEBUG_STREAM || ''));
+                const debugPaths = debugStream ? new Set() : null;
+                const debugNumerics = debugStream ? new Set() : null;
+                const debugRaw = [];
+                const scanDebugNumerics = (obj, prefix, depth) => {
+                    if (!obj || typeof obj !== 'object' || depth > 4) return;
+                    for (const [key, value] of Object.entries(obj)) {
+                        if (typeof value === 'number') {
+                            if (/token|usage|cost|quota|credit/i.test(key)) debugNumerics.add(`${prefix}${key}=${value}`);
+                        } else if (value && typeof value === 'object') {
+                            scanDebugNumerics(value, `${prefix}${key}.`, depth + 1);
+                        }
+                    }
+                };
+                const finishDebugStream = () => {
+                    if (!debugStream) return;
+                    try {
+                        const file = path.join(os.tmpdir(), `deepseek_stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jsonl`);
+                        fs.writeFileSync(file, debugRaw.join('\n'));
+                        console.log(`[stream-debug] keys/paths: ${[...debugPaths].sort().join(' ')}`);
+                        console.log(`[stream-debug] numeric usage fields: ${debugNumerics.size ? [...debugNumerics].sort().join(' ') : '(none)'}`);
+                        console.log(`[stream-debug] raw stream: ${file}`);
+                    } catch (e) {
+                        console.log(`[stream-debug] could not save raw stream: ${e.message}`);
+                    }
+                };
 
                 const rebuildFragmentState = () => {
                     const { responseText, thinkText } = rebuildFragmentText(fragments);
@@ -2216,6 +2531,15 @@ const server = http.createServer(async (req, res) => {
                         if (line.startsWith('data: ')) {
                             try {
                                 const d = JSON.parse(line.slice(6));
+                                if (debugStream) {
+                                    if (debugRaw.length < 5000) debugRaw.push(line);
+                                    for (const key of Object.keys(d)) debugPaths.add(key);
+                                    if (d.p) debugPaths.add(`p=${d.p}`);
+                                    if (d.v && typeof d.v === 'object' && !Array.isArray(d.v)) {
+                                        for (const key of Object.keys(d.v)) debugPaths.add(`v.${key}`);
+                                    }
+                                    scanDebugNumerics(d, '', 0);
+                                }
                                 if (d.response_message_id !== undefined && !newMessageId) newMessageId = d.response_message_id;
                                 if (isDeepSeekModelErrorEvent(d)) {
                                     modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
@@ -2238,11 +2562,27 @@ const server = http.createServer(async (req, res) => {
                                     if (d.v.response.finish_reason !== undefined) {
                                         finishReason = d.v.response.finish_reason;
                                     }
+                                    if (Number.isFinite(d.v.response.accumulated_token_usage)) {
+                                        // The first sighting is the context the chat already
+                                        // carried; later sightings are the running total.
+                                        if (tokenUsageStart === null) tokenUsageStart = d.v.response.accumulated_token_usage;
+                                        tokenUsageTotal = d.v.response.accumulated_token_usage;
+                                    }
                                 }
                                 if (lastPath === 'response/fragments' && d.v !== undefined) {
                                     appendFragments(d.v);
                                 }
                                 if (lastPath === 'response' && d.v !== undefined) {
+                                    // The authoritative figure arrives in the closing
+                                    // BATCH patch: accumulated_token_usage + quasi_status.
+                                    if (Array.isArray(d.v)) {
+                                        for (const op of d.v) {
+                                            if (op && op.p === 'accumulated_token_usage' && Number.isFinite(op.v)) {
+                                                if (tokenUsageStart === null) tokenUsageStart = op.v;
+                                                tokenUsageTotal = op.v;
+                                            }
+                                        }
+                                    }
                                     applyResponsePatchOperations(d.v, appendFragments);
                                 }
                                 if (lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
@@ -2273,10 +2613,14 @@ const server = http.createServer(async (req, res) => {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
 
-                return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError };
+                finishDebugStream();
+                const upstreamTokens = tokenUsageTotal === null
+                    ? null
+                    : { start: tokenUsageStart === null ? 0 : tokenUsageStart, total: tokenUsageTotal };
+                return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError, upstreamTokens };
             }
 
-            let { content: fullContent, reasoningContent, finishReason, modelError } = await readDeepSeekResponse(dsResp.body);
+            let { content: fullContent, reasoningContent, finishReason, modelError, upstreamTokens } = await readDeepSeekResponse(dsResp.body);
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
             const elapsed = Date.now() - startTime;
@@ -2326,6 +2670,9 @@ const server = http.createServer(async (req, res) => {
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
+                // The retried call is the one the client is paying for, so its
+                // counter is the one that belongs in the usage report.
+                upstreamTokens = retryResult.upstreamTokens || upstreamTokens;
                 // A previous empty response may have carried finish_reason=length.
                 // Never leak it into a successful retry that supplied no reason.
                 finishReason = retryState.finishReason;
@@ -2390,6 +2737,11 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
+            // Non-empty content survived every recovery path, so the account just
+            // served a real turn. Only now is it safe to clear the rate-limit
+            // streak that markRateLimited escalated.
+            markAccountHealthy(accounts.find(a => a.id === session.accountId) || null);
+
             // Auto-continuation: if finish_reason is 'length' or content is very long (>25000 chars),
             // send a continuation request to get the rest of the response
             let continuationRounds = 0;
@@ -2427,6 +2779,16 @@ const server = http.createServer(async (req, res) => {
                     fullContent += '\n' + contContent;
                     if (contReasoning) reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
                     finishReason = contResult.finishReason;
+                    // A continuation is billable on top of the turn it extends, so
+                    // fold its spend into the same usage report.
+                    if (contResult.upstreamTokens) {
+                        upstreamTokens = upstreamTokens
+                            ? {
+                                start: upstreamTokens.start,
+                                total: Math.max(upstreamTokens.total, contResult.upstreamTokens.total),
+                            }
+                            : contResult.upstreamTokens;
+                    }
                     console.log(`${agentTag} Continuation added ${contContent.length} chars (total: ${fullContent.length})`);
                 } else {
                     console.log(`${agentTag} Continuation returned nothing useful, stopping`);
@@ -2474,6 +2836,7 @@ const server = http.createServer(async (req, res) => {
                         fullContent = retryContent2;
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                         toolCall = retryTc;
+                        upstreamTokens = retryResult2.upstreamTokens || upstreamTokens;
                     } else {
                         console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
@@ -2524,10 +2887,14 @@ const server = http.createServer(async (req, res) => {
             }
 
             storeHistory(agentId, prompt, fullContent, toolCall);
+            // The remote chat id and message count are final for this turn; make
+            // them durable so a restart resumes instead of rebuilding.
+            scheduleSessionPersist();
 
             const openaiResponse = toolCall
-                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
-                : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
+                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent, upstreamTokens)
+                : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason, upstreamTokens);
+            console.log(`${agentTag} usage: ${upstreamTokens ? 'upstream' : 'estimate'} prompt=${openaiResponse.usage.prompt_tokens} completion=${openaiResponse.usage.completion_tokens} total=${openaiResponse.usage.total_tokens}`);
 
             if (stream) {
                 if (apiMode === 'anthropic') {
@@ -2535,7 +2902,8 @@ const server = http.createServer(async (req, res) => {
                 } else if (apiMode === 'responses') {
                     sendResponsesStream(res, openaiResponse);
                 } else {
-                    sendOpenAIStream(res, openaiResponse);
+                    // `stream_options.include_usage: false` is the only way to opt out.
+                    sendOpenAIStream(res, openaiResponse, body?.stream_options?.include_usage !== false);
                 }
                 console.log(`${agentTag} Streamed ${apiMode} (tool=${!!toolCall}) in ${elapsed}ms`);
             } else {
@@ -2647,6 +3015,7 @@ async function main() {
     }
     const shouldStart = await showStartupMenu();
     if (!shouldStart) process.exit(0);
+    loadPersistedSessions();
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') console.error(`[DS-API] FATAL: port ${PORT} already in use. Set PORT=<other> or stop the other instance.`);
         else console.error('[DS-API] server error:', err);
@@ -2675,6 +3044,10 @@ if (require.main === module) {
     // Graceful shutdown: stop accepting, drain, then exit (force-exit after 10s).
     const shutdown = (sig) => {
         console.log(`[DS-API] ${sig} received — shutting down…`);
+        // Flush synchronously: the debounced writer may not have fired yet and
+        // the remote chat ids in it are what make the next boot cheap.
+        if (sessionPersistTimer) { clearTimeout(sessionPersistTimer); sessionPersistTimer = null; }
+        persistSessions();
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(0), 10000).unref();
     };
@@ -2697,6 +3070,15 @@ module.exports = {
         parseDsmlToolCall,
         looksLikeToolCallMarkup,
         dumpFailedToolMarkup,
+        resolveUpstreamUsage,
+        buildUsage,
+        extractLastUserTurn,
+        conversationFingerprint,
+        resolveAgentId,
+        AGENT_HEADER_NAME,
+        serializeSession,
+        loadPersistedSessions,
+        sessions,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
         buildRecoveryHistoryPrefix,
@@ -2725,6 +3107,7 @@ module.exports = {
         paceUpstreamCall,
         isRateLimitMessage,
         markRateLimited,
+        markAccountHealthy,
         MIN_REQUEST_INTERVAL_MS,
         REQUEST_JITTER_MS,
         UPSTREAM_CALL_GAP_MS,

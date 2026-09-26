@@ -333,6 +333,39 @@ FreeDeepseekAPI не создаёт новый DeepSeek чат на каждый
 - если клиент уже прислал multi-turn history, локальная recovery-history второй раз не добавляется;
 - пустой ответ повторяется максимум `DEEPSEEK_MAX_RETRIES` раз (по умолчанию 2), причём на каждом retry контекст уменьшается.
 
+### Сессии переживают рестарт прокси
+
+Remote chat id — самая ценная часть сессии: именно он держит контекст на стороне DeepSeek и делает возможными delta-промпты. Поэтому он сохраняется на диск в `data/sessions.json` (права `0600`, файл в `.gitignore`) вместе с recovery-буфером и привязкой к аккаунту.
+
+Перезапуск прокси теперь продолжает тот же разговор:
+
+```
+[DS-API] Restored 1 session(s) from sessions.json
+[my-project/acct:account_1] Reusing session: af925b50-… (parent: 2, msg#1)
+```
+
+Запись атомарная (write + rename), при повреждённом файле прокси стартует с чистых сессий, а не падает. Сессии старше `DEEPSEEK_SESSION_TTL_MS` не восстанавливаются — такой remote chat DeepSeek всё равно выбросил. Отключить: `DEEPSEEK_PERSIST_SESSIONS=0`. Никакие токены и cookies в файл не пишутся, только идентификаторы чатов.
+
+### Как клиент идентифицирует свою сессию
+
+Прокси берёт ключ из первого доступного:
+
+1. заголовок `x-agent-session` (имя можно сменить: `DEEPSEEK_AGENT_HEADER`);
+2. `?session=` или поле `user`;
+3. `DEEPSEEK_AGENT_ID` — жёстко закрепить один агент;
+4. **отпечаток разговора** — хеш первой реплики пользователя;
+5. адрес клиента (localhost без всего выше схлопывается в `dev-agent`).
+
+Пункт 4 — то, что нужно opencode: он не шлёт заголовок сессии, но каждый ход отправляет **весь** транскрипт, а первая реплика пользователя в нём не меняется за всю жизнь чата. Поэтому каждый твой чат в opencode автоматически получает свой DeepSeek-чат (`conv-…` в логах) вместо общей ветки `dev-agent`. Компактизация opencode переписывает начало транскрипта — это считается новым разговором и начинает новый DeepSeek-чат, полный транскрипт уйдёт заново.
+
+Отключить: `DEEPSEEK_AGENT_FINGERPRINT=0`. Увидеть, что реально присылает харнесс: `DEEPSEEK_DEBUG_SESSION=1` — в лог попадут все заголовки с `session|conversation|chat|user|agent|thread` в имени.
+
+Своё имя сессии задаётся заголовком:
+
+```bash
+-H "x-agent-session: my-project-backend"
+```
+
 Явно задать agent/session:
 
 ```bash
@@ -480,6 +513,25 @@ curl -X POST http://localhost:9655/v1/chat/completions \
 - usage: `usage.completion_tokens_details.reasoning_tokens`
 
 `reasoning_tokens` — приблизительная оценка по извлечённому DeepSeek Web `THINK`-тексту, потому что web stream не отдаёт официальный token usage по reasoning отдельно.
+
+### Учёт токенов
+
+Прокси берёт **реальные** цифры от DeepSeek, а не оценивает их. В финальном patch-батче web-протокола приходит накопительный счётчик `accumulated_token_usage`; прирост счётчика за запрос — это фактически потраченные токены:
+
+- `total_tokens` — точное значение от DeepSeek (накопительный счётчик чата минус его значение на старте хода);
+- `prompt_tokens` / `completion_tokens` — пропорциональное деление этой точной суммы, потому что счётчик накопительный и из-за кэша промпта не делится однозначно на ввод и вывод; поэтому `prompt + completion === total` всегда сходится и подходит для расчёта стоимости;
+- если счётчик не пришёл или не вырос — используется оценка `длина/4`.
+
+Раньше оценка `длина/4` врала на порядок: дельта-промпт — это 2 сообщения поверх большого удалённого чата, который оценщик не видел. На живом примере ход стоил 348 токенов, а отдавалось 11.
+
+Форматы ответа: OpenAI (`usage.prompt_tokens/completion_tokens/total_tokens`), Anthropic (`usage.input_tokens/output_tokens`), Responses (`usage.input_tokens/output_tokens/total_tokens`). В стриминге OpenAI-совместимый usage приходит отдельным чанком с пустым `choices` перед `data: [DONE]`; отключается `"stream_options": {"include_usage": false}`. Anthropic-стрим отдаёт usage в `message_start` и `message_delta`.
+
+Оценить реальный расход по сессии можно так:
+
+```bash
+grep "usage:" logs/server.log
+# [dev-agent] usage: upstream prompt=232 completion=116 total=348
+```
 
 ### Web search
 

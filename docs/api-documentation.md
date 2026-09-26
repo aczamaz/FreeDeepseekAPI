@@ -137,6 +137,15 @@ data: {"p": "response/done"}
 - On first call, `parent_message_id` is `null`
 - The first SSE event (metadata) contains the first characters of content; subsequent `response/content` events append more
 - On session reuse, the first 2 characters ("TO") arrive in the metadata content, the rest in content events
+- **Token accounting:** the opening `response` event carries `accumulated_token_usage` (the chat's running total, e.g. `0` on a fresh chat), and the stream closes with a BATCH patch that advances it:
+
+```
+data: {"v":{"response":{"message_id":4,"status":"WIP","accumulated_token_usage":360,...}}}
+...
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":450},{"p":"quasi_status","v":"FINISHED"}]}
+```
+
+  The growth (`450 - 360 = 90`) is what the request actually cost, counting only tokens DeepSeek processed (cached context is not re-billed). This is the only real usage signal the web API exposes — see §3.9.
 
 ### 2.4 Proof-of-Work (SHA3 Wasm)
 
@@ -406,6 +415,28 @@ Response (all):
 
 ---
 
+### 3.9 Token Usage
+
+All three API shapes report usage from DeepSeek's own `accumulated_token_usage` counter, so harnesses (opencode, Claude Code, OpenAI SDK) get native cost accounting without a local tokenizer:
+
+| Shape | Fields |
+|---|---|
+| `/v1/chat/completions` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens`, `usage.completion_tokens_details.reasoning_tokens` |
+| `/v1/messages` | `usage.input_tokens`, `usage.output_tokens` |
+| `/v1/responses` | `usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens`, `usage.output_tokens_details.reasoning_tokens` |
+| OpenAI streaming | final usage-only chunk with `choices: []` before `data: [DONE]`; opt out with `"stream_options": {"include_usage": false}` |
+| Anthropic streaming | `usage` in `message_start` and in the terminal `message_delta` |
+
+Rules:
+- `total_tokens` is the exact counter growth for the request and is authoritative.
+- `prompt_tokens` / `completion_tokens` split that exact total by the estimated ratio, because the counter is cumulative and prompt caching makes an exact input/output split impossible. `prompt_tokens + completion_tokens === total_tokens` always holds, so cost maths stays consistent.
+- Retries and continuations fold their own counter growth into the reported usage; the retried call wins.
+- A missing or non-advancing counter falls back to the `length/4` estimate.
+- `reasoning_tokens` has no upstream counterpart and stays an estimate, clamped to the reported completion.
+- Set `DEEPSEEK_DEBUG_STREAM=1` to log the stream's JSON-patch paths and dump the raw stream to `$TMPDIR/deepseek_stream_*.jsonl` when investigating usage.
+
+---
+
 ## 4. Multi-Agent Session Isolation
 
 ### 4.1 How Sessions Are Assigned
@@ -441,11 +472,37 @@ The proxy uses `user` from the request body. If not set, it falls back to the cl
   parentMessageId: <int|null>,   // Last message ID for threading
   createdAt: <timestamp>,        // Session creation time
   messageCount: 0-100,           // Messages in this session
+  accountId: "account_1",        // Sticky account assignment
+  lastActivityAt: <timestamp>,   // Drives TTL eviction (RAM sweep and restore)
   history: [                     // Last 3 exchanges (recovery buffer, capped at 2000 chars)
     { user: "...", assistant: "..." }
   ]
 }
 ```
+
+### 4.4 Session Persistence
+
+The map is mirrored to `data/sessions.json` (override with `DEEPSEEK_SESSIONS_FILE`), mode `0600`, git-ignored, holding chat ids only — never tokens or cookies.
+
+```json
+{
+  "version": 1,
+  "savedAt": 1790456000000,
+  "sessions": [
+    ["my-project", { "id": "af925b50-…", "parentMessageId": 2, "messageCount": 1, "accountId": "account_1", "history": [] }]
+  ]
+}
+```
+
+| Behaviour | Detail |
+|---|---|
+| Write timing | Debounced 500ms after activity, after each completed turn, and synchronously on `SIGINT`/`SIGTERM` |
+| Write safety | Temp file + `rename()` so a crash mid-write cannot strand every chat id |
+| Restore | On boot, entries older than `DEEPSEEK_SESSION_TTL_MS` are skipped (DeepSeek has dropped them) |
+| Corrupt file | Logged and ignored; the proxy starts with no sessions instead of failing |
+| Opt out | `DEEPSEEK_PERSIST_SESSIONS=0` keeps everything in RAM |
+
+Identity key precedence: `x-agent-session` header (rename with `DEEPSEEK_AGENT_HEADER`) → `?session=` / `user` field → `DEEPSEEK_AGENT_ID` → conversation fingerprint (sha256 of the opening user message, so each opencode chat gets its own DeepSeek chat) → peer address (loopback collapses to the single `dev-agent`). `DEEPSEEK_AGENT_FINGERPRINT=0` restores the address-only fallback. `DEEPSEEK_DEBUG_SESSION=1` logs the identity headers a client actually sends.
 
 ---
 

@@ -93,7 +93,7 @@ async function main(args = process.argv.slice(2)) {
       }
     }
   }
-  console.log('\nSession reuse: one x-agent-session/user => one DeepSeek chat until TTL/message limit/error reset.');
+  console.log('\nSession reuse: one x-agent-session/user/conversation => one DeepSeek chat until TTL/message limit/error reset.');
   console.log('Reset: curl -X POST "http://localhost:9655/reset-session?agent=all"');
   console.log('VPS: import auth on server, then run NON_INTERACTIVE=1 npm start');
   return ok ? 0 : 2;

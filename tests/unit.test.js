@@ -448,6 +448,215 @@ test('parseToolCall rejects partially consumed DSML parameters and wrapper scope
   }
 });
 
+test('severe compaction preserves the last user task and flags the dropped context', () => {
+  const pad = 'z'.repeat(50000);
+  let conv = 'User: первая задача\n\nAssistant: ок\n\n';
+  for (let i = 0; i < 6; i++) conv += `Tool: ${pad}\n\nAssistant: продолжаю\n\n`;
+  conv += 'User: ГЛАВНАЯ ЗАДАЧА: переименуй экспорт\n\nAssistant: Принял\n\n';
+  for (let i = 0; i < 6; i++) conv += `Tool: ${pad}\n\nAssistant: продолжаю\n\n`;
+
+  const built = serverInternals.buildBoundedPrompt('system prompt', '', conv, 24000);
+  assert.equal(built.compacted, true);
+  assert.equal(built.taskRescued, true, 'the task sat in the dropped middle and must be rescued');
+  assert.ok(built.prompt.length <= 24000, `prompt ${built.prompt.length} exceeded the budget`);
+  assert.match(built.prompt, /ГЛАВНАЯ ЗАДАЧА/);
+  assert.match(built.prompt, /\[CONTEXT NOTE\]/);
+  // The rescued task terminates the prompt, so the length clamp can never cut it.
+  assert.ok(built.prompt.trimEnd().endsWith('переименуй экспорт'), built.prompt.slice(-120));
+});
+
+test('a prompt that already fits is sent untouched', () => {
+  const conv = 'User: короткая задача\n\nAssistant: ок\n\n';
+  const built = serverInternals.buildBoundedPrompt('system', '', conv, 24000);
+  assert.equal(built.compacted, false);
+  assert.equal(built.taskRescued, undefined);
+  assert.equal(built.prompt, 'system\n\nUser: короткая задача\n\nAssistant: ок');
+});
+
+test('last user turn extraction stops at the assistant reply', () => {
+  assert.equal(serverInternals.extractLastUserTurn('User: первый\n\nAssistant: ок\n\nUser: второй\n\nAssistant: да'), 'User: второй');
+  assert.equal(serverInternals.extractLastUserTurn('User: единственный\n\nAssistant: да'), 'User: единственный');
+  assert.equal(serverInternals.extractLastUserTurn('Assistant: без запроса'), '');
+  assert.equal(serverInternals.extractLastUserTurn(''), '');
+});
+
+test('each conversation gets its own DeepSeek chat when the client sends no id', () => {
+  const chatA = [
+    { role: 'system', content: 'you are opencode' },
+    { role: 'user', content: 'почини пайплайн деплоя в backend' },
+    { role: 'assistant', content: 'смотрю' },
+    { role: 'user', content: 'а теперь тесты' },
+  ];
+  const chatB = [
+    { role: 'system', content: 'you are opencode' },
+    { role: 'user', content: 'напиши компонент кнопки' },
+  ];
+  // Same client, same address, no identity header — exactly what opencode does.
+  const a1 = serverInternals.resolveAgentId({ remoteAddr: '127.0.0.1', messages: chatA });
+  const a2 = serverInternals.resolveAgentId({ remoteAddr: '127.0.0.1', messages: [...chatA, { role: 'user', content: 'ещё' }] });
+  const b1 = serverInternals.resolveAgentId({ remoteAddr: '127.0.0.1', messages: chatB });
+
+  assert.equal(a1.source, 'conversation');
+  assert.match(a1.agentId, /^conv-[0-9a-f]{16}$/);
+  assert.equal(a1.agentId, a2.agentId, 'the same chat must keep its key as the transcript grows');
+  assert.notEqual(a1.agentId, b1.agentId, 'a different chat must not share the DeepSeek conversation');
+  assert.notEqual(a1.agentId, 'dev-agent', 'conversations no longer collapse into dev-agent');
+});
+
+test('an explicit identity always wins over the fingerprint', () => {
+  const messages = [{ role: 'user', content: 'один и тот же первый вопрос' }];
+  const header = serverInternals.resolveAgentId({ headerValue: 'my-project', remoteAddr: '127.0.0.1', messages });
+  assert.deepEqual(header, { agentId: 'my-project', source: 'header' });
+  const param = serverInternals.resolveAgentId({ paramValue: 'user-42', remoteAddr: '127.0.0.1', messages });
+  assert.deepEqual(param, { agentId: 'user-42', source: 'param' });
+});
+
+test('no conversation to fingerprint falls back to the peer identity', () => {
+  assert.deepEqual(
+    serverInternals.resolveAgentId({ remoteAddr: '127.0.0.1', messages: [{ role: 'system', content: 'only system' }] }),
+    { agentId: 'dev-agent', source: 'loopback' },
+  );
+  assert.deepEqual(
+    serverInternals.resolveAgentId({ remoteAddr: '10.0.0.5', messages: [] }),
+    { agentId: '10.0.0.5', source: 'peer' },
+  );
+  // A trivially short opening message is not a usable fingerprint.
+  assert.equal(serverInternals.conversationFingerprint([{ role: 'user', content: 'ok' }]), '');
+  assert.equal(serverInternals.conversationFingerprint([{ role: 'user', content: [] }]), '');
+  assert.equal(serverInternals.conversationFingerprint(null), '');
+});
+
+test('fingerprint ignores later turns but respects a rewritten opening', () => {
+  const first = serverInternals.conversationFingerprint([{ role: 'user', content: 'исходная задача' }]);
+  const grown = serverInternals.conversationFingerprint([
+    { role: 'user', content: 'исходная задача' },
+    { role: 'assistant', content: 'ответ' },
+    { role: 'user', content: 'другой вопрос' },
+  ]);
+  assert.equal(first, grown);
+  // Compaction rewrites the opening turn, which is a different conversation.
+  const compacted = serverInternals.conversationFingerprint([
+    { role: 'user', content: '[compacted] пересказ прежнего диалога' },
+  ]);
+  assert.notEqual(first, compacted);
+});
+
+test('stream rate limits escalate until a real turn proves the account healthy', () => {
+  const account = { id: 'account_1', cooldownUntil: 0, failures: 0, rateLimitStreak: 0 };
+  const base = 300;
+
+  // Repeated 429s must escalate instead of restarting at the base cooldown.
+  const first = serverInternals.markRateLimited(account, 'too often');
+  const second = serverInternals.markRateLimited(account, 'too often');
+  const third = serverInternals.markRateLimited(account, 'too often');
+  assert.equal(first, base);
+  assert.equal(second, base * 2);
+  assert.equal(third, base * 2, 'cooldown is capped');
+  assert.equal(account.rateLimitStreak, 3);
+
+  // A completed turn is the only thing that clears the streak.
+  serverInternals.markAccountHealthy(account);
+  assert.equal(account.rateLimitStreak, 0);
+  assert.equal(account.failures, 0);
+  assert.equal(serverInternals.markRateLimited(account, 'too often'), base, 'escalation restarts from the base cooldown');
+});
+
+test('markAccountHealthy tolerates a missing account and a clean one', () => {
+  assert.doesNotThrow(() => serverInternals.markAccountHealthy(null));
+  const clean = { id: 'account_2', cooldownUntil: 0, failures: 0, rateLimitStreak: 0 };
+  serverInternals.markAccountHealthy(clean);
+  assert.equal(clean.rateLimitStreak, 0);
+});
+
+test('upstream token counter overrides the chars/4 estimate', () => {
+  const estimated = { promptTokens: 11, completionTokens: 3, reasoningTokens: 0 };
+
+  // Live chat: the counter grew 450 -> 770, so the request really cost 320
+  // tokens even though the delta prompt alone looks like 14.
+  const live = serverInternals.resolveUpstreamUsage({ start: 450, total: 770 }, estimated);
+  assert.equal(live.source, 'upstream');
+  assert.equal(live.total_tokens, 320);
+  assert.equal(live.prompt_tokens + live.completion_tokens, live.total_tokens);
+  assert.ok(live.prompt_tokens > 0 && live.completion_tokens > 0);
+
+  // First message of a chat starts the counter at zero.
+  const fresh = serverInternals.resolveUpstreamUsage({ start: 0, total: 360 }, estimated);
+  assert.equal(fresh.source, 'upstream');
+  assert.equal(fresh.total_tokens, 360);
+  assert.equal(fresh.prompt_tokens + fresh.completion_tokens, 360);
+
+  // A counter that did not advance yields no information, so the estimate stands.
+  for (const upstream of [null, undefined, {}, { start: 5, total: 5 }, { start: 9, total: 3 }, { start: 'x', total: 'y' }]) {
+    const fallback = serverInternals.resolveUpstreamUsage(upstream, estimated);
+    assert.equal(fallback.source, 'estimate', JSON.stringify(upstream));
+    assert.equal(fallback.prompt_tokens, 11);
+    assert.equal(fallback.completion_tokens, 3);
+    assert.equal(fallback.total_tokens, 14);
+  }
+});
+
+test('reported reasoning tokens never exceed the reported completion', () => {
+  const usage = serverInternals.buildUsage('prompt', 'ok', 'x'.repeat(4000), { start: 100, total: 120 });
+  assert.equal(usage.total_tokens, 20);
+  assert.ok(usage.completion_tokens_details.reasoning_tokens <= usage.completion_tokens);
+  assert.equal(usage.prompt_tokens + usage.completion_tokens, usage.total_tokens);
+});
+
+test('session persistence round-trips remote chat ids and drops expired entries', () => {
+  const dir = tmpdir();
+  const file = path.join(dir, 'sessions.json');
+  const now = Date.now();
+  const saved = {
+    version: 1,
+    savedAt: now,
+    sessions: [
+      ['keep-me', {
+        id: 'chat-abc', parentMessageId: 42, createdAt: now - 1000, messageCount: 7,
+        accountId: 'account_1', history: [{ user: 'hi', assistant: 'yo' }],
+        lastActivityAt: now - 60_000,
+      }],
+      ['too-old', {
+        id: 'chat-gone', parentMessageId: 1, createdAt: now - 10_000_000, messageCount: 99,
+        accountId: 'account_1', history: [], lastActivityAt: now - 10 * 60 * 60 * 1000,
+      }],
+    ],
+  };
+  fs.writeFileSync(file, JSON.stringify(saved), { mode: 0o600 });
+
+  const sessions = serverInternals.sessions;
+  sessions.clear();
+  const restored = serverInternals.loadPersistedSessions(file);
+  assert.equal(restored, 1);
+  assert.ok(sessions.has('keep-me'));
+  assert.equal(sessions.get('keep-me').id, 'chat-abc');
+  assert.equal(sessions.get('keep-me').parentMessageId, 42);
+  assert.equal(sessions.get('keep-me').messageCount, 7);
+  assert.equal(sessions.get('keep-me').accountId, 'account_1');
+  // An entry past the session TTL points at a remote chat DeepSeek has dropped.
+  assert.equal(sessions.has('too-old'), false);
+
+  // Serialization must keep exactly the fields a restored session needs.
+  const round = serverInternals.serializeSession(sessions.get('keep-me'));
+  assert.equal(round.id, 'chat-abc');
+  assert.equal(round.parentMessageId, 42);
+  assert.equal(round.messageCount, 7);
+  assert.deepEqual(round.history, [{ user: 'hi', assistant: 'yo' }]);
+  sessions.clear();
+});
+
+test('a corrupt session file is ignored instead of breaking startup', () => {
+  const dir = tmpdir();
+  const file = path.join(dir, 'sessions.json');
+  fs.writeFileSync(file, '{ this is not json');
+  const sessions = serverInternals.sessions;
+  sessions.clear();
+  assert.equal(serverInternals.loadPersistedSessions(file), 0);
+  assert.equal(sessions.size, 0);
+  // A missing file is the normal first-boot case, not an error.
+  assert.equal(serverInternals.loadPersistedSessions(path.join(dir, 'missing.json')), 0);
+  sessions.clear();
+});
+
 test('failed tool markup is dumped to a file so the format can be fixed offline', () => {
   const first = 'half-written tool call: {"tool_call": {"name": "read_file"';
   const repair = '{"tool_call":{"name":"read_file","argu';
@@ -897,13 +1106,17 @@ test('upstream pacing spaces consecutive slots on the same account', async () =>
 test('upstream pacing jitter only ever lengthens the gap', async () => {
   const account = { id: 'jittered', nextSlotAt: 0 };
   await serverInternals.acquireAccountSlot(account, 60, 0);
-  const gapBefore = account.nextSlotAt - Date.now();
+  const firstSlot = account.nextSlotAt;
 
   for (let i = 0; i < 5; i++) {
+    const before = account.nextSlotAt;
     const wait = await serverInternals.acquireAccountSlot(account, 60, 400);
-    assert.ok(wait >= 60 - 10, `jitter shortened the wait to ${wait}ms`);
-    assert.ok(account.nextSlotAt - Date.now() >= gapBefore - 10, 'jitter must not shrink the reserved gap');
+    assert.ok(wait >= 50, `jitter shortened the wait to ${wait}ms`);
+    // Assert on the absolute reservation, not on a remaining-time measurement:
+    // an event-loop stall elsewhere in the suite must not fail a scheduling test.
+    assert.ok(account.nextSlotAt > before, `jitter did not push the slot out: ${before} -> ${account.nextSlotAt}`);
   }
+  assert.ok(firstSlot > 0);
 });
 
 test('default upstream pacing leaves a wide, jittered gap', () => {

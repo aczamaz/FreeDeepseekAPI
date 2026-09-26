@@ -7,6 +7,9 @@ deepseek-auth.json
 deepseek-accounts.json
 # Runtime-added auth files contain secrets — keep the dir, ignore its contents.
 data/accounts/*.json
+# Persisted remote chat ids + recovery snippets; runtime state, not source.
+data/sessions.json
+data/sessions.json.*.tmp
 .chrome-profile-deepseek/
 .chrome-profile-*/
 .chrome-for-testing-profile-deepseek/
