@@ -560,6 +560,12 @@ const MODEL_CONFIGS = {
         capabilities: { reasoning: false, web_search: false, files: true },
         supported: true,
     },
+    'deepseek-flash': {
+        model_type: 'default', thinking_enabled: false, search_enabled: false,
+        real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
+        capabilities: { reasoning: false, web_search: false, files: true },
+        supported: true,
+    },
     'deepseek-v3': {
         model_type: 'default', thinking_enabled: false, search_enabled: false,
         real_model: 'DeepSeek-V4-Flash non-thinking (DeepSeek Web “Быстрый” / default)',
@@ -704,12 +710,137 @@ function applyResponsePatchOperations(ops, appendFragments) {
     return applied;
 }
 
+// Splits the upstream SSE body into `data:` lines. DeepSeek terminates the
+// stream without a final newline, so the buffered tail is a real event (it
+// carries the end of the answer, the finish_reason and the closing token
+// totals) and must be flushed after the loop.
+async function readDeepSeekSseLines(readable, onLine) {
+    const decoder = new TextDecoder();  // one instance: preserves multi-byte (Cyrillic/emoji) split across chunks
+    let buffer = '';
+    for await (const chunk of readable) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) onLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer) onLine(buffer);
+}
+
+// Accumulates one DeepSeek Web JSON-patch SSE stream. Kept out of the request
+// handler so the line handling is testable on its own: the upstream protocol is
+// a JSON-patch stream, so finish_reason and token totals only appear in the
+// last event, which is the one a naive line split throws away.
+function createDeepSeekStreamAccumulator() {
+    const state = {
+        lastPath: null,
+        fragments: [],
+        content: '',
+        reasoning: '',
+        messageId: null,
+        finishReason: null,
+        modelError: null,
+        tokenUsageStart: null,
+        tokenUsageTotal: null,
+    };
+
+    const rebuild = () => {
+        const { responseText, thinkText } = rebuildFragmentText(state.fragments);
+        if (responseText) state.content = responseText;
+        state.reasoning = thinkText;
+    };
+
+    const appendFragments = (value) => {
+        const incoming = Array.isArray(value) ? value : [value];
+        for (const fragment of incoming) {
+            if (fragment && typeof fragment === 'object') state.fragments.push({ ...fragment });
+        }
+        rebuild();
+    };
+
+    const handleEvent = (d) => {
+        if (d.response_message_id !== undefined && !state.messageId) state.messageId = d.response_message_id;
+        if (isDeepSeekModelErrorEvent(d)) {
+            state.modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
+        }
+        if (d.finish_reason) state.finishReason = d.finish_reason;
+        if (d.p !== undefined) state.lastPath = d.p;
+        if (d.v && typeof d.v === 'object' && d.v.response) {
+            if (d.v.response.message_id !== undefined) state.messageId = d.v.response.message_id;
+            if (d.v.response.content !== undefined) state.content = d.v.response.content;
+            if (Array.isArray(d.v.response.fragments)) {
+                state.fragments.length = 0;
+                appendFragments(d.v.response.fragments);
+            }
+            if (d.v.response.finish_reason !== undefined) state.finishReason = d.v.response.finish_reason;
+            if (Number.isFinite(d.v.response.accumulated_token_usage)) {
+                if (state.tokenUsageStart === null) state.tokenUsageStart = d.v.response.accumulated_token_usage;
+                state.tokenUsageTotal = d.v.response.accumulated_token_usage;
+            }
+        }
+        if (state.lastPath === 'response/fragments' && d.v !== undefined) {
+            appendFragments(d.v);
+        }
+        if (state.lastPath === 'response' && d.v !== undefined) {
+            if (Array.isArray(d.v)) {
+                for (const op of d.v) {
+                    if (op && op.p === 'accumulated_token_usage' && Number.isFinite(op.v)) {
+                        if (state.tokenUsageStart === null) state.tokenUsageStart = op.v;
+                        state.tokenUsageTotal = op.v;
+                    }
+                }
+            }
+            applyResponsePatchOperations(d.v, appendFragments);
+        }
+        if (state.lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
+            if (state.fragments.length > 0) {
+                const lastFragment = state.fragments[state.fragments.length - 1];
+                lastFragment.content = `${lastFragment.content || ''}${d.v}`;
+                rebuild();
+            }
+        }
+        if (state.lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
+            state.content += d.v;
+        }
+        if (state.lastPath === 'response/finish_reason' && d.v !== undefined) {
+            state.finishReason = d.v;
+        }
+        if (state.lastPath === 'response/status' && d.v !== undefined && d.v !== 'FINISHED') {
+            state.finishReason = d.v;
+        }
+    };
+
+    return {
+        state,
+        handleLine(line) {
+            if (!line || !line.startsWith('data: ')) return;
+            let d;
+            try { d = JSON.parse(line.slice(6)); } catch (e) { return; }
+            try { handleEvent(d); } catch (e) { }
+        },
+        result() {
+            const upstreamTokens = state.tokenUsageTotal === null
+                ? null
+                : { start: state.tokenUsageStart === null ? 0 : state.tokenUsageStart, total: state.tokenUsageTotal };
+            return {
+                content: state.content,
+                reasoningContent: state.reasoning,
+                messageId: state.messageId,
+                finishReason: state.finishReason,
+                modelError: state.modelError,
+                upstreamTokens,
+            };
+        },
+    };
+}
+
 function resolveModelConfig(model) {
     const requested = String(model || 'deepseek-chat').toLowerCase();
     return MODEL_CONFIGS[requested] || MODEL_CONFIGS['deepseek-chat'];
 }
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
+
 
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
     const modelCfg = resolveModelConfig(model);
@@ -1038,17 +1169,55 @@ function coerceToolCallObject(obj, { allowBare = false } = {}) {
     );
 }
 
+const MAX_TOOL_MARKUP_REPAIR_CLOSERS = 8;
+
+function missingJsonClosers(raw) {
+    const scan = scanUnclosedJsonContainers(raw);
+    if (!scan) return null;
+    return scan.closers;
+}
+
+function scanUnclosedJsonContainers(text) {
+    const stack = [];
+    const openers = [];
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\') { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{' || ch === '[') { stack.push(ch); openers.push(i); }
+        else if (ch === '}' || ch === ']') { stack.pop(); openers.pop(); }
+    }
+    if (inString || stack.length === 0 || stack.length > MAX_TOOL_MARKUP_REPAIR_CLOSERS) return null;
+    let closers = '';
+    for (let i = stack.length - 1; i >= 0; i--) closers += stack[i] === '{' ? '}' : ']';
+    return { start: openers[0], raw: text.substring(openers[0]), closers };
+}
+
 function parseJsonToolCandidate(raw, label = 'json', options = {}) {
     if (!raw) return null;
-    try {
-        const parsed = JSON.parse(raw);
-        const tc = coerceToolCallObject(parsed, options);
-        if (tc) {
-            console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
-            return tc;
+    const candidates = [raw];
+    // A reply cut mid-envelope is only ever missing the tail braces, and the
+    // argument payload is already complete, so closing the open containers is a
+    // lossless repair. Bounded to a few closers and an explicit envelope so
+    // half-written prose can never be promoted into an executable call.
+    const closers = missingJsonClosers(raw);
+    if (closers && /"tool_calls?"\s*:|"function_calls?"\s*:/.test(raw)) candidates.push(raw + closers);
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            const tc = coerceToolCallObject(parsed, options);
+            if (tc) {
+                if (candidate !== raw) console.log(`[parseToolCall] ${label} repaired truncated envelope (+${closers.length} closers)`);
+                console.log(`[parseToolCall] SUCCESS ${label}: ${tc.name} (args=${tc.arguments.length} chars)`);
+                return tc;
+            }
+        } catch (e) {
+            if (candidate === raw) console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
         }
-    } catch (e) {
-        console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
     }
     return null;
 }
@@ -1068,14 +1237,14 @@ function canonicalizeToolMarkupTag(rawTag) {
         closing = true;
         token = token.substring(1).trim();
     }
-    token = token.replace(/^DSML(?=(?:tool[\s_-]*calls|function[\s_-]*calls|invoke|parameter)\b)/i, '');
+    token = token.replace(/^DSML(?=(?:tool[\s_-]*calls|function[\s_-]*calls|calls|invoke|parameter)\b)/i, '');
 
     if (!closing && /^name\s*=/i.test(token)) return `<direct ${token}>`;
 
-    const semantic = token.match(/^(?:(?:[A-Za-z_][\w.-]*):)?(tool[\s_-]*calls|function[\s_-]*calls|invoke|parameter)\b([\s\S]*)$/i);
+    const semantic = token.match(/^(?:(?:[A-Za-z_][\w.-]*):)?(tool[\s_-]*calls|function[\s_-]*calls|calls|invoke|parameter)\b([\s\S]*)$/i);
     if (!semantic) return null;
     const localName = semantic[1].replace(/[\s_-]/g, '').toLowerCase();
-    const canonicalName = localName === 'toolcalls' || localName === 'functioncalls'
+    const canonicalName = (localName === 'toolcalls' || localName === 'functioncalls' || localName === 'calls')
         ? 'tool_calls'
         : localName;
     const attrs = closing ? '' : semantic[2];
@@ -1113,7 +1282,7 @@ function getMarkupAttribute(attrs, attribute) {
 function readDsmlTagAt(text, start) {
     if (text[start] !== '<') return null;
     const prefix = text.substring(start + 1, Math.min(text.length, start + 40)).trimStart();
-    if (!/^\/?(?:tool_calls|invoke|parameter|direct)\b/i.test(prefix)) return null;
+    if (!/^\/?(?:tool[\s_-]*calls|function[\s_-]*calls|calls|invoke|parameter|direct)\b/i.test(prefix)) return null;
     let quote = null;
     let end = -1;
     const scanEnd = Math.min(text.length, start + MAX_DSML_TAG_CHARS + 1);
@@ -1145,10 +1314,13 @@ function readDsmlTagAt(text, start) {
         selfClosing = true;
         token = token.substring(0, token.length - 1).trim();
     }
-    const match = token.match(/^(tool_calls|invoke|parameter|direct)\b([\s\S]*)$/i);
+    const match = token.match(/^(tool[\s_-]*calls|function[\s_-]*calls|calls|invoke|parameter|direct)\b([\s\S]*)$/i);
     if (!match) return null;
+    const localName = match[1].replace(/[\s_-]/g, '').toLowerCase();
     return {
-        name: match[1].toLowerCase(),
+        name: (localName === 'calls' || localName === 'toolcalls' || localName === 'functioncalls')
+            ? 'tool_calls'
+            : localName,
         attrs: closing ? '' : match[2],
         closing,
         selfClosing,
@@ -1259,13 +1431,53 @@ function extractToolCallScope(normalized) {
     return null;
 }
 
+// The body of a DSML wrapper must be nothing but one explicit tool-call
+// envelope — balanced, or missing only its tail closers. Anything else stays
+// unparseable, so the wrapper cannot smuggle extra text into an executable call.
+function parseSingleEnvelopeBody(body, label) {
+    const start = body.indexOf('{');
+    if (start === -1 || body.substring(0, start).trim()) return null;
+    const rest = body.substring(start);
+    const objects = extractBalancedJsonObjects(rest);
+    if (objects.length === 1 && !rest.substring(objects[0].length).trim()) {
+        const tc = parseJsonToolCandidate(objects[0], label);
+        if (tc) return tc;
+    }
+    const truncated = scanUnclosedJsonContainers(rest);
+    if (truncated && truncated.start === 0 && /"tool_calls?"\s*:|"function_calls?"\s*:/.test(rest)) {
+        return parseJsonToolCandidate(rest, label);
+    }
+    return null;
+}
+
+// Wrapper tag with no closing sibling and no invoke/parameter children: the
+// model opened the DSML block and then wrote a plain JSON envelope into it.
+function parseDsmlUnterminatedJsonBody(normalized) {
+    const tags = scanDsmlStructuralTags(normalized);
+    if (!tags || tags.length !== 1) return null;
+    const opening = tags[0];
+    if (opening.name !== 'tool_calls' || opening.closing || opening.selfClosing) return null;
+    return parseSingleEnvelopeBody(normalized.substring(opening.end), 'dsml-json-unterminated');
+}
+
 function parseDsmlToolCall(text) {
     if (String(text || '').length > MAX_TOOL_MARKUP_CHARS) return null;
     const normalized = normalizeToolMarkupTags(text);
+    const unterminated = parseDsmlUnterminatedJsonBody(normalized);
+    if (unterminated) return unterminated;
     const scope = extractToolCallScope(normalized);
     if (scope === null) return null;
     const tags = scanDsmlStructuralTags(scope);
-    if (!tags || tags.length === 0) return null;
+    if (!tags) return null;
+
+    // Hybrid: the wrapper is present but the body is a plain JSON envelope
+    // instead of invoke/parameter tags. A body with no structural tags at all
+    // is exactly this case.
+    if (tags.every(tag => tag.name === 'tool_calls')) {
+        const parsed = parseSingleEnvelopeBody(scope, 'dsml-json');
+        if (parsed) return parsed;
+    }
+    if (tags.length === 0) return null;
     const first = tags[0];
     if (scope.substring(0, first.start).trim()) return null;
 
@@ -1378,6 +1590,15 @@ function parseToolCall(text) {
     // tool-call envelopes are executable; bare {name, arguments} examples are not.
     for (const rawJson of extractBalancedJsonObjects(text)) {
         const tc = parseJsonToolCandidate(rawJson, 'inline');
+        if (tc) return tc;
+    }
+
+    // A reply the stream cut mid-envelope never yields a balanced object, so the
+    // scan above sees nothing. Retry from the outermost unclosed container with
+    // its missing tail closers appended.
+    const truncated = scanUnclosedJsonContainers(text);
+    if (truncated && /"tool_calls?"\s*:|"function_calls?"\s*:/.test(truncated.raw)) {
+        const tc = parseJsonToolCandidate(truncated.raw, 'inline-truncated');
         if (tc) return tc;
     }
 
@@ -2467,20 +2688,7 @@ const server = http.createServer(async (req, res) => {
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason }
             async function readDeepSeekResponse(readable) {
-                let buffer = '';
-                let lastPath = null;
-                const fragments = [];
-                let fullContent = '';
-                let reasoningContent = '';
-                let newMessageId = null;
-                let finishReason = null;
-                let modelError = null;
-                let tokenUsageStart = null;
-                let tokenUsageTotal = null;
-
-                // Opt-in stream introspection: the upstream protocol is a JSON-patch
-                // stream, so the only reliable way to learn what it reports (token
-                // counts included) is to look at the paths it actually sends.
+                const acc = createDeepSeekStreamAccumulator();
                 const debugStream = /^(1|true|yes|on)$/i.test(String(process.env.DEEPSEEK_DEBUG_STREAM || ''));
                 const debugPaths = debugStream ? new Set() : null;
                 const debugNumerics = debugStream ? new Set() : null;
@@ -2495,6 +2703,24 @@ const server = http.createServer(async (req, res) => {
                         }
                     }
                 };
+                const recordDebugLine = (line) => {
+                    if (!debugStream) return;
+                    if (debugRaw.length < 5000) debugRaw.push(line);
+                    let d;
+                    try { d = JSON.parse(line.slice(6)); } catch (e) { return; }
+                    if (!d || typeof d !== 'object') return;
+                    for (const key of Object.keys(d)) debugPaths.add(key);
+                    if (d.p) debugPaths.add(`p=${d.p}`);
+                    if (d.v && typeof d.v === 'object' && !Array.isArray(d.v)) {
+                        for (const key of Object.keys(d.v)) debugPaths.add(`v.${key}`);
+                    }
+                    scanDebugNumerics(d, '', 0);
+                };
+                const handleLine = (line) => {
+                    if (!line || !line.startsWith('data: ')) return;
+                    recordDebugLine(line);
+                    acc.handleLine(line);
+                };
                 const finishDebugStream = () => {
                     if (!debugStream) return;
                     try {
@@ -2508,116 +2734,18 @@ const server = http.createServer(async (req, res) => {
                     }
                 };
 
-                const rebuildFragmentState = () => {
-                    const { responseText, thinkText } = rebuildFragmentText(fragments);
-                    if (responseText) fullContent = responseText;
-                    reasoningContent = thinkText;
-                };
+                await readDeepSeekSseLines(readable, handleLine);
 
-                const appendFragments = (value) => {
-                    const incoming = Array.isArray(value) ? value : [value];
-                    for (const fragment of incoming) {
-                        if (fragment && typeof fragment === 'object') fragments.push({ ...fragment });
-                    }
-                    rebuildFragmentState();
-                };
-
-                const decoder = new TextDecoder();  // one instance: preserves multi-byte (Cyrillic/emoji) split across chunks
-                for await (const chunk of readable) {
-                    buffer += decoder.decode(chunk, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const d = JSON.parse(line.slice(6));
-                                if (debugStream) {
-                                    if (debugRaw.length < 5000) debugRaw.push(line);
-                                    for (const key of Object.keys(d)) debugPaths.add(key);
-                                    if (d.p) debugPaths.add(`p=${d.p}`);
-                                    if (d.v && typeof d.v === 'object' && !Array.isArray(d.v)) {
-                                        for (const key of Object.keys(d.v)) debugPaths.add(`v.${key}`);
-                                    }
-                                    scanDebugNumerics(d, '', 0);
-                                }
-                                if (d.response_message_id !== undefined && !newMessageId) newMessageId = d.response_message_id;
-                                if (isDeepSeekModelErrorEvent(d)) {
-                                    modelError = { type: d.type || 'error', content: d.content || '', finish_reason: d.finish_reason || null };
-                                }
-                                if (d.finish_reason) {
-                                    finishReason = d.finish_reason;
-                                }
-                                if (d.p !== undefined) lastPath = d.p;
-                                if (d.v && typeof d.v === 'object' && d.v.response) {
-                                    if (d.v.response.message_id !== undefined) {
-                                        newMessageId = d.v.response.message_id;
-                                    }
-                                    if (d.v.response.content !== undefined) {
-                                        fullContent = d.v.response.content;
-                                    }
-                                    if (Array.isArray(d.v.response.fragments)) {
-                                        fragments.length = 0;
-                                        appendFragments(d.v.response.fragments);
-                                    }
-                                    if (d.v.response.finish_reason !== undefined) {
-                                        finishReason = d.v.response.finish_reason;
-                                    }
-                                    if (Number.isFinite(d.v.response.accumulated_token_usage)) {
-                                        // The first sighting is the context the chat already
-                                        // carried; later sightings are the running total.
-                                        if (tokenUsageStart === null) tokenUsageStart = d.v.response.accumulated_token_usage;
-                                        tokenUsageTotal = d.v.response.accumulated_token_usage;
-                                    }
-                                }
-                                if (lastPath === 'response/fragments' && d.v !== undefined) {
-                                    appendFragments(d.v);
-                                }
-                                if (lastPath === 'response' && d.v !== undefined) {
-                                    // The authoritative figure arrives in the closing
-                                    // BATCH patch: accumulated_token_usage + quasi_status.
-                                    if (Array.isArray(d.v)) {
-                                        for (const op of d.v) {
-                                            if (op && op.p === 'accumulated_token_usage' && Number.isFinite(op.v)) {
-                                                if (tokenUsageStart === null) tokenUsageStart = op.v;
-                                                tokenUsageTotal = op.v;
-                                            }
-                                        }
-                                    }
-                                    applyResponsePatchOperations(d.v, appendFragments);
-                                }
-                                if (lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
-                                    if (fragments.length > 0) {
-                                        const lastFragment = fragments[fragments.length - 1];
-                                        lastFragment.content = `${lastFragment.content || ''}${d.v}`;
-                                        rebuildFragmentState();
-                                    }
-                                }
-                                if (lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
-                                    fullContent += d.v;
-                                }
-                                if (lastPath === 'response/finish_reason' && d.v !== undefined) {
-                                    finishReason = d.v;
-                                }
-                                if (lastPath === 'response/status' && d.v !== undefined && d.v !== 'FINISHED') {
-                                    finishReason = d.v;
-                                }
-                            } catch (e) { }
-                        }
-                    }
-                }
-
-                if (newMessageId) {
-                    session.parentMessageId = newMessageId;
+                const result = acc.result();
+                if (result.messageId) {
+                    session.parentMessageId = result.messageId;
                     session.messageCount++;
                 } else {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
 
                 finishDebugStream();
-                const upstreamTokens = tokenUsageTotal === null
-                    ? null
-                    : { start: tokenUsageStart === null ? 0 : tokenUsageStart, total: tokenUsageTotal };
-                return { content: fullContent, reasoningContent, messageId: newMessageId, finishReason, modelError, upstreamTokens };
+                return result;
             }
 
             let { content: fullContent, reasoningContent, finishReason, modelError, upstreamTokens } = await readDeepSeekResponse(dsResp.body);
@@ -3064,6 +3192,8 @@ module.exports = {
         createUpstreamHttpError,
         rebuildFragmentText,
         applyResponsePatchOperations,
+        createDeepSeekStreamAccumulator,
+        readDeepSeekSseLines,
         compactToolSchema,
         formatToolDefinitions,
         parseToolCall,

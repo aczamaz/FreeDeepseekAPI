@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { Readable } = require('node:stream');
 const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -395,6 +396,113 @@ test('parseToolCall accepts only explicit JSON envelopes with valid object argum
       { function: { name: 'write_file', arguments: '{}' } },
     ],
   })), null);
+});
+
+test('parseToolCall accepts the bare DSML `calls` wrapper and JSON bodies', () => {
+  const bareWrapper = [
+    'Вопросы:',
+    '<｜｜DSML｜｜ calls>',
+    '<｜｜DSML｜｜ invoke name="question">',
+    '<｜｜DSML｜｜ parameter name="questions" string="false">[{"question":"a?"}]</｜｜DSML｜｜ parameter>',
+    '</｜｜DSML｜｜ invoke>',
+    '</｜｜DSML｜｜ calls>',
+  ].join('\n');
+  const bareCall = serverInternals.parseToolCall(bareWrapper);
+  assert.equal(bareCall.name, 'question');
+  assert.deepEqual(JSON.parse(bareCall.arguments), { questions: [{ question: 'a?' }] });
+
+  // Wrapper opened, envelope written inside it, closing wrapper never sent.
+  const unterminated = 'Ситуация:\n\n<｜｜DSML｜｜ calls>\n{"tool_call":{"name":"question","arguments":{"questions":[]}}}';
+  const unterminatedCall = serverInternals.parseToolCall(unterminated);
+  assert.equal(unterminatedCall.name, 'question');
+
+  // Closed wrapper whose body is a plain envelope instead of parameter tags.
+  const hybrid = '<｜｜DSML｜｜ calls>{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}</｜｜DSML｜｜ calls>';
+  const hybridCall = serverInternals.parseToolCall(hybrid);
+  assert.equal(hybridCall.name, 'read_file');
+  assert.deepEqual(JSON.parse(hybridCall.arguments), { path: '/tmp/a' });
+
+  // A wrapper still gates what runs: extra text or a bare example is not a call.
+  assert.equal(serverInternals.parseToolCall('<｜｜DSML｜｜ calls>{"name":"read_file","arguments":{}}</｜｜DSML｜｜ calls>'), null);
+  assert.equal(serverInternals.parseToolCall('<｜｜DSML｜｜ calls>{"tool_call":{"name":"x","arguments":{}}} trailing</｜｜DSML｜｜ calls>'), null);
+});
+
+test('parseToolCall repairs envelopes the stream cut short', () => {
+  // One missing tail brace: the common case when the SSE reader drops the
+  // final `data:` line, and when the model stops mid-object.
+  const cut = 'Вопрос:\n\n{"tool_call":{"name":"question","arguments":{"questions":[{"question":"a?"}]}}';
+  const repaired = serverInternals.parseToolCall(cut);
+  assert.equal(repaired.name, 'question');
+  assert.deepEqual(JSON.parse(repaired.arguments), { questions: [{ question: 'a?' }] });
+
+  const cutOpenai = '{"tool_calls":[{"type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"/tmp/a\\"}"}}]';
+  assert.deepEqual(JSON.parse(serverInternals.parseToolCall(cutOpenai).arguments), { path: '/tmp/a' });
+
+  // A cut that lands inside a string, or that drops too much, stays unparseable.
+  assert.equal(serverInternals.parseToolCall('{"tool_call":{"name":"x","argu'), null);
+  const deeplyCut = `{"tool_call":{"name":"x","arguments":${'['.repeat(40)}`;
+  assert.equal(serverInternals.parseToolCall(deeplyCut), null);
+  // Closing the envelope must not invent a missing value.
+  assert.equal(serverInternals.parseToolCall('prose {"tool_call":{"name":"x","arguments":'), null);
+  // Unbalanced prose braces are not an envelope, so they are never repaired.
+  assert.equal(serverInternals.parseToolCall('prose {"a": [1, 2'), null);
+});
+
+test('the SSE accumulator keeps the final line that carries no trailing newline', () => {
+  // DeepSeek terminates the stream without a final newline. That last `data:`
+  // line holds the tail of the answer, the finish_reason and the token totals;
+  // dropping it truncated every reply and left finish_reason null.
+  const acc = serverInternals.createDeepSeekStreamAccumulator();
+  const feed = (raw) => raw.split('\n').forEach(line => acc.handleLine(line));
+
+  feed([
+    'data: {"response_message_id":"m1","p":"response/fragments","v":[{"type":"RESPONSE","content":"{\\"tool_call\\":{\\"name\\":\\"quest"}]}',
+    'data: {"p":"response/fragments/-1/content","v":"ion\\",\\"arguments\\":{}}"}',
+    'data: {"p":"response/finish_reason","v":"stop"}',
+    'data: {"p":"response","v":[{"p":"accumulated_token_usage","v":4242}]}',
+  ].join('\n') + '\n\n');
+  feed('data: {"p":"response/fragments/-1/content","v":"}"}');
+
+  const result = acc.result();
+  assert.equal(result.content, '{"tool_call":{"name":"question","arguments":{}}}');
+  assert.equal(result.finishReason, 'stop');
+  assert.deepEqual(result.upstreamTokens, { start: 4242, total: 4242 });
+  assert.equal(result.messageId, 'm1');
+
+  // A stream that does end with a newline must not be read twice.
+  const closed = serverInternals.createDeepSeekStreamAccumulator();
+  closed.handleLine('data: {"p":"response/content","v":"ab"}');
+  closed.handleLine('');
+  assert.equal(closed.result().content, 'ab');
+
+  // Malformed lines stay ignored instead of poisoning the accumulator.
+  const noisy = serverInternals.createDeepSeekStreamAccumulator();
+  noisy.handleLine('data: {not json');
+  noisy.handleLine('event: ping');
+  noisy.handleLine('');
+  assert.equal(noisy.result().content, '');
+  assert.equal(noisy.result().finishReason, null);
+});
+
+test('readDeepSeekSseLines flushes the unterminated tail line', async () => {
+  const collect = async (chunks) => {
+    const seen = [];
+    const readable = Readable.from(chunks.map(c => Buffer.from(c, 'utf8')));
+    await serverInternals.readDeepSeekSseLines(readable, line => seen.push(line));
+    return seen;
+  };
+
+  // No trailing newline: the last event is the tail of the answer.
+  const unterminated = await collect(['data: {"a":1}\n\ndata: {"b":2}']);
+  assert.deepEqual(unterminated, ['data: {"a":1}', '', 'data: {"b":2}']);
+  // With one, the stream is not read twice.
+  assert.deepEqual(await collect(['data: {"a":1}\n\ndata: {"b":2}\n']), unterminated);
+  // Multi-byte characters split across chunk boundaries survive.
+  assert.deepEqual(
+    await collect(['data: {"t":"кирил', 'лица"}\n']),
+    ['data: {"t":"кириллица"}'],
+  );
+  assert.deepEqual(await collect(['']), []);
 });
 
 test('parseToolCall bounds tool markup and scans unmatched braces in linear time', () => {
