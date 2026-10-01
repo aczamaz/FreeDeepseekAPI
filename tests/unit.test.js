@@ -1438,3 +1438,32 @@ test('stream helpers preserve the request-level exact CORS origin', () => {
     assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
   }
 });
+
+test('browser auth works on a fresh checkout', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'deepseek_chrome_auth.js'), 'utf8');
+
+  // data/accounts/ is gitignored, so on a fresh clone the auth file's parent
+  // does not exist. Writing without mkdir lost the token right after a login
+  // that had already succeeded.
+  const save = src.indexOf('fs.writeFileSync(outPath');
+  const mkdir = src.indexOf('fs.mkdirSync(path.dirname(outPath)');
+  assert.ok(save > 0, 'auth file is never written');
+  assert.ok(mkdir > 0 && mkdir < save, 'auth save must create its parent dir first');
+
+  // Every platform needs a branch: puppeteer is not a dependency, so the
+  // ~/.cache/puppeteer fallback that hides this on some machines is absent
+  // everywhere else.
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    assert.match(src, new RegExp(`process\\.platform === '${platform}'`), `no ${platform} branch`);
+  }
+  // $PATH scan is what rescues nix/flatpak and per-user installs.
+  assert.match(src, /function findOnPath\(bin\)/);
+  assert.match(src, /findOnPath\(bin\)/);
+  assert.match(src, /'chromium'/);
+
+  // The script drives Chrome over the global WebSocket, so Node 18/20 in
+  // package.json engines is a lie that only fails at runtime.
+  assert.match(src, /typeof WebSocket === 'undefined'/);
+  const engines = require('../package.json').engines.node;
+  assert.equal(engines, '>=22.0.0', 'engines must match the WebSocket requirement');
+});

@@ -18,6 +18,7 @@
 */
 const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
@@ -96,8 +97,21 @@ function removeProfileSafely(dir) {
     }
 }
 
+// Distro/nix/flatpak installs rarely land in /usr/bin, so fall back to $PATH.
+function findOnPath(bin) {
+    const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+    for (const dir of dirs) {
+        const candidate = path.join(dir, bin);
+        try {
+            if (fs.statSync(candidate).isFile()) return candidate;
+        } catch { /* not here, keep looking */ }
+    }
+    return '';
+}
+
 function resolveChromePath() {
     if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
 
     // Prefer Puppeteer's bundled "Google Chrome for Testing" when available.
     for (const base of [repoRoot, qwenRepoRoot]) {
@@ -179,9 +193,38 @@ function resolveChromePath() {
         const candidates = [
             '/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
             '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            // Per-user installs miss /Applications, and every Chromium fork
+            // speaks CDP, so a missing Chrome is not a dead end.
+            path.join(os.homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+            '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+            '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+            '/Applications/Arc.app/Contents/MacOS/Arc',
         ];
         for (const c of candidates) {
             if (fs.existsSync(c)) return c;
+        }
+        for (const bin of ['google-chrome', 'chromium', 'microsoft-edge', 'brave-browser']) {
+            const found = findOnPath(bin);
+            if (found) return found;
+        }
+    } else if (process.platform === 'linux') {
+        // Distro packages put Chrome in different places, and nix/flatpak installs
+        // put it nowhere near /usr/bin — so check the usual spots, then $PATH.
+        const candidates = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/opt/google/chrome/chrome',
+            '/usr/bin/chromium-browser',
+            '/usr/bin/chromium',
+            '/snap/bin/chromium',
+        ];
+        for (const c of candidates) {
+            if (fs.existsSync(c)) return c;
+        }
+        for (const bin of ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser']) {
+            const found = findOnPath(bin);
+            if (found) return found;
         }
     }
 
@@ -396,13 +439,20 @@ How to fix:
     # or install Chrome for Testing / Google Chrome.
 
   Linux / Chromium:
-    CHROME_PATH=$(which chromium) npm run auth
-    # Ubuntu example: sudo apt install chromium-browser || sudo apt install chromium
+    CHROME_PATH=$(which google-chrome || which chromium) npm run auth
+    # Debian/Ubuntu: sudo apt install chromium || sudo apt install chromium-browser
+    # Fedora/RHEL:   sudo dnf install chromium || sudo dnf install google-chrome-stable
 
 If Chrome is installed elsewhere, set CHROME_PATH to the real executable path.`;
 }
 
 async function main() {
+    if (typeof WebSocket === 'undefined') {
+        throw new Error(
+            `This script needs the global WebSocket from Node 22+, but you run ${process.version}.
+Install a newer Node and try again: nvm install 22 && nvm use 22`,
+        );
+    }
     if (!fs.existsSync(chromePath))
         throw new Error(chromeInstallHelp(chromePath));
 
@@ -469,6 +519,10 @@ async function main() {
         await sleep(500);
     }
     const { href, cookiesCount, ...persisted } = auth;
+    // A fresh clone has no data/accounts/, and DEEPSEEK_AUTH_PATH usually points
+    // straight into it — so create the parent before saving, or the token is lost
+    // after a login that already succeeded.
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
     console.log(`[auth] Saved: ${outPath}`);
     console.log(`[auth] page: ${href || 'unknown'}`);
