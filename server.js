@@ -1049,7 +1049,7 @@ function formatToolDefinitions(tools) {
     text += '2. Do NOT simulate, guess, or fabricate command output — wait for the actual result\n';
     text += '3. The tool runs on ' + SERVER_HOST + ' (' + SERVER_PUBLIC_IP + '), the local server — NOT on DeepSeek\n';
     text += '4. After the tool executes, the result will be sent to you as a new user/tool message\n';
-    text += '5. Never add explanation before or after the tool request when requesting a tool\n';
+    text += '5. Say briefly what you are about to do and why, then emit the tool request. Keep it to a few lines — no file dumps, no command output\n';
     text += '6. Keep arguments compact. Do not include large file contents unless the tool schema requires it.\n\n';
     text += 'Available functions:\n';
     for (const tool of tools) {
@@ -1065,6 +1065,7 @@ function formatToolDefinitions(tools) {
     }
     text += '\n--- END TOOL REQUEST SYSTEM ---\n';
     text += '\nREMEMBER: Request tools only with strict JSON or TOOL_CALL legacy format. Never simulate results.';
+    text += ' Plain prose before the tool request is shown to the user as your answer, so write it for them.';
     return text;
 }
 
@@ -1096,8 +1097,8 @@ function extractBalancedJsonAt(text, startIndex) {
     return null;
 }
 
-function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES) {
-    const objects = [];
+function extractBalancedJsonSpans(text, maxObjects = MAX_TOOL_JSON_CANDIDATES) {
+    const spans = [];
     let start = -1;
     let depth = 0;
     let inString = false;
@@ -1121,13 +1122,17 @@ function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES)
         if (ch === '}') {
             depth--;
             if (depth === 0) {
-                objects.push(text.substring(start, i + 1));
-                if (objects.length >= maxObjects) return objects;
+                spans.push({ start, raw: text.substring(start, i + 1) });
+                if (spans.length >= maxObjects) return spans;
                 start = -1;
             }
         }
     }
-    return objects;
+    return spans;
+}
+
+function extractBalancedJsonObjects(text, maxObjects = MAX_TOOL_JSON_CANDIDATES) {
+    return extractBalancedJsonSpans(text, maxObjects).map(span => span.raw);
 }
 
 function buildToolCall(name, args = {}) {
@@ -1529,16 +1534,54 @@ function dumpFailedToolMarkup(label, ...parts) {
     }
 }
 
-function parseToolCall(text) {
+// The models that drive this proxy explain themselves in prose and then append
+// the tool call, and that prose is the only trace of their reasoning a user
+// ever sees. Surfacing it is the whole point, so the parsers report where the
+// executable markup starts: everything before that offset is model prose by
+// construction, never payload, and can be shown as normal assistant text.
+const MAX_TOOL_PREAMBLE_CHARS = 8000;
+const TOOL_MARKUP_START_PATTERNS = {
+    dsml: /[<＜]?[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i,
+    xml: /<\s*tool_call\b/i,
+    fence: /```/,
+    legacy: /TOOL_CALL\s*:/i,
+    json: /["'](?:tool_call|tool_calls|function_call)["']\s*:/i,
+};
+// Markdown fences are legitimate inside an explanation, so they do not veto the
+// preamble; an unparsed envelope or a DSML tag left above the executable markup
+// does, because showing it as prose would put markup back on screen.
+const TOOL_MARKUP_VETO_PATTERNS = [
+    TOOL_MARKUP_START_PATTERNS.dsml,
+    TOOL_MARKUP_START_PATTERNS.xml,
+    TOOL_MARKUP_START_PATTERNS.legacy,
+    TOOL_MARKUP_START_PATTERNS.json,
+];
+
+function toolCallPreamble(text, markupStart) {
+    if (!Number.isInteger(markupStart) || markupStart <= 0) return '';
+    const head = text.substring(0, markupStart);
+    for (const pattern of TOOL_MARKUP_VETO_PATTERNS) {
+        if (pattern.test(head)) return '';
+    }
+    const value = head.trim();
+    if (!value) return '';
+    if (value.length <= MAX_TOOL_PREAMBLE_CHARS) return value;
+    return value.substring(0, MAX_TOOL_PREAMBLE_CHARS - 3).trimEnd() + '...';
+}
+
+function parseToolCallDetailed(text) {
     if (!text || typeof text !== 'string') return null;
     if (text.length > MAX_TOOL_MARKUP_CHARS) {
         console.log(`[parseToolCall] Refusing oversized tool markup candidate (${text.length} chars)`);
         return null;
     }
 
-    if (/[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(text)) {
+    if (TOOL_MARKUP_START_PATTERNS.dsml.test(text)) {
         const dsml = parseDsmlToolCall(text);
-        if (dsml) return dsml;
+        if (dsml) {
+            const start = text.search(TOOL_MARKUP_START_PATTERNS.dsml);
+            return { toolCall: dsml, preamble: toolCallPreamble(text, start) };
+        }
         console.log('[parseToolCall] Tool markup found but wrapper/invoke was incomplete or malformed');
         return null;
     }
@@ -1548,7 +1591,7 @@ function parseToolCall(text) {
     if (xmlMatch) {
         const inner = xmlMatch[1].trim();
         const tc = parseJsonToolCandidate(inner, 'xml', { allowBare: true });
-        if (tc) return tc;
+        if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, xmlMatch.index) };
     }
 
     // Fenced JSON blocks.
@@ -1556,14 +1599,15 @@ function parseToolCall(text) {
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
         const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
-        if (tc) return tc;
+        if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, fence.index) };
     }
 
     // Legacy TOOL_CALL: name + first balanced JSON object after it.
     const match = text.match(/TOOL_CALL:\s*([\w-]+)\s*/i);
     if (match) {
         const name = match[1];
-        const afterMatch = text.substring(match.index + match[0].length);
+        const payloadStart = match.index + match[0].length;
+        const afterMatch = text.substring(payloadStart);
         const braceIdx = afterMatch.indexOf('{');
         if (braceIdx !== -1) {
             const rawJson = extractBalancedJsonAt(afterMatch, braceIdx);
@@ -1573,7 +1617,7 @@ function parseToolCall(text) {
                     const tc = buildToolCall(name, args);
                     if (tc) {
                         console.log(`[parseToolCall] SUCCESS legacy: ${name} (args=${rawJson.length} chars)`);
-                        return tc;
+                        return { toolCall: tc, preamble: toolCallPreamble(text, match.index) };
                     }
                 } catch (e) {
                     console.log(`[parseToolCall] legacy JSON.parse failed: ${e.message.substring(0,100)}`);
@@ -1588,9 +1632,9 @@ function parseToolCall(text) {
 
     // Scan each top-level balanced object once (linear time). Only explicit
     // tool-call envelopes are executable; bare {name, arguments} examples are not.
-    for (const rawJson of extractBalancedJsonObjects(text)) {
-        const tc = parseJsonToolCandidate(rawJson, 'inline');
-        if (tc) return tc;
+    for (const span of extractBalancedJsonSpans(text)) {
+        const tc = parseJsonToolCandidate(span.raw, 'inline');
+        if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, span.start) };
     }
 
     // A reply the stream cut mid-envelope never yields a balanced object, so the
@@ -1599,11 +1643,16 @@ function parseToolCall(text) {
     const truncated = scanUnclosedJsonContainers(text);
     if (truncated && /"tool_calls?"\s*:|"function_calls?"\s*:/.test(truncated.raw)) {
         const tc = parseJsonToolCandidate(truncated.raw, 'inline-truncated');
-        if (tc) return tc;
+        if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, truncated.start) };
     }
 
     console.log(`[parseToolCall] No tool call match in ${text.length} chars`);
     return null;
+}
+
+function parseToolCall(text) {
+    const parsed = parseToolCallDetailed(text);
+    return parsed ? parsed.toolCall : null;
 }
 
 /**
@@ -1664,34 +1713,46 @@ function resolveUpstreamUsage(upstream, estimated = {}) {
 }
 
 function buildUsage(prompt, content, reasoningContent = '', upstream = null) {
+    return buildUsageReport(prompt, content, reasoningContent, upstream).usage;
+}
+
+function buildUsageReport(prompt, content, reasoningContent = '', upstream = null) {
     const resolved = resolveUpstreamUsage(upstream, {
         promptTokens: estimateTokens(prompt),
         completionTokens: estimateTokens(content) + estimateTokens(reasoningContent),
         reasoningTokens: estimateTokens(reasoningContent),
     });
     return {
-        prompt_tokens: resolved.prompt_tokens,
-        completion_tokens: resolved.completion_tokens,
-        total_tokens: resolved.total_tokens,
-        completion_tokens_details: {
-            reasoning_tokens: resolved.completion_tokens_details.reasoning_tokens
-        }
+        usage: {
+            prompt_tokens: resolved.prompt_tokens,
+            completion_tokens: resolved.completion_tokens,
+            total_tokens: resolved.total_tokens,
+            completion_tokens_details: {
+                reasoning_tokens: resolved.completion_tokens_details.reasoning_tokens
+            }
+        },
+        // Logged separately so a non-advancing upstream counter is reported as
+        // the estimate it actually is, not as real accounting.
+        source: resolved.source,
     };
 }
 
-function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '', upstreamTokens = null) {
+function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = '', reasoningContent = '', upstreamTokens = null, content = '') {
     const id = 'call_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    const text = typeof content === 'string' ? content : '';
     const message = {
         role: 'assistant',
-        content: null,
+        // A tool turn may legitimately carry the model's own preamble next to
+        // the call, which is what the user actually reads. Reasoning stays out:
+        // some agent clients treat any reasoning payload on a tool turn as a
+        // final answer and stop their tool loop.
+        content: text || null,
         tool_calls: [{
             id: id,
             type: 'function',
             function: { name: toolCall.name, arguments: toolCall.arguments }
         }]
     };
-    // Do not attach reasoning to tool-call turns. Some agent clients treat any
-    // reasoning/text payload as a final assistant answer and stop their tool loop.
     return {
         id: 'ds-' + Date.now(),
         object: 'chat.completion',
@@ -1702,7 +1763,7 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
             message,
             finish_reason: 'tool_calls'
         }],
-        usage: buildUsage(prompt, '', reasoningContent, upstreamTokens),
+        usage: buildUsage(prompt, text, reasoningContent, upstreamTokens),
         watermark: FORGETMEAI_WATERMARK
     };
 }
@@ -1922,6 +1983,11 @@ function toResponsesResponse(openaiResp) {
         for (const tc of msg.tool_calls) {
             output.push({ type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}' });
         }
+        // A tool turn can still carry the model's own preamble, which is a
+        // separate message item ahead of the function call.
+        if (msg.content) {
+            output.unshift({ id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content, annotations: [] }] });
+        }
     } else {
         output.push({ id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: msg.content || '', annotations: [] }] });
     }
@@ -1960,6 +2026,19 @@ function sendResponsesStream(res, openaiResp) {
         outputIndex++;
     }
     if (hasToolCalls) {
+        if (msg.content) {
+            const text = msg.content;
+            const item = { id: 'msg_' + Date.now(), type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
+            writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress', content: [] } });
+            writeSse(res, 'response.content_part.added', { type: 'response.content_part.added', output_index: outputIndex, content_index: 0, item_id: item.id, part: { type: 'output_text', text: '', annotations: [] } });
+            for (let i = 0; i < text.length; i += 80) {
+                writeSse(res, 'response.output_text.delta', { type: 'response.output_text.delta', output_index: outputIndex, content_index: 0, item_id: item.id, delta: text.substring(i, i + 80) });
+            }
+            writeSse(res, 'response.output_text.done', { type: 'response.output_text.done', output_index: outputIndex, content_index: 0, item_id: item.id, text });
+            writeSse(res, 'response.content_part.done', { type: 'response.content_part.done', output_index: outputIndex, content_index: 0, item_id: item.id, part: item.content[0] });
+            writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
+            outputIndex++;
+        }
         msg.tool_calls.forEach((tc) => {
             const item = { type: 'function_call', id: 'fc_' + tc.id, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || '{}', status: 'completed' };
             writeSse(res, 'response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, arguments: '', status: 'in_progress' } });
@@ -2003,6 +2082,13 @@ function sendOpenAIStream(res, openaiResp, includeUsage = true) {
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
         }
     }
+    // The model's preamble goes out as ordinary content before the call, so the
+    // client renders the explanation and then runs the tool.
+    const preamble = hasToolCalls ? (msg.content || '') : '';
+    for (let i = 0; i < preamble.length; i += 50) {
+        const chunk = preamble.substring(i, i + 50);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] })}\n\n`);
+    }
     const done = () => {
         if (includeUsage && openaiResp.usage) {
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: openaiResp.usage })}\n\n`);
@@ -2024,10 +2110,13 @@ function sendOpenAIStream(res, openaiResp, includeUsage = true) {
     res.end();
 }
 
-function storeHistory(agentId, prompt, content, toolCall) {
+function storeHistory(agentId, prompt, content, toolCall, toolCallPreamble = '') {
     const session = getOrCreateAgentSession(agentId);
+    // The preamble is what the user saw, so the next turn must see it too —
+    // otherwise the model forgets it already explained itself and repeats it.
+    const preamble = typeof toolCallPreamble === 'string' && toolCallPreamble ? `${toolCallPreamble}\n\n` : '';
     const assistantResponse = toolCall
-        ? `TOOL_CALL: ${toolCall.name}\narguments: ${toolCall.arguments}`
+        ? `${preamble}TOOL_CALL: ${toolCall.name}\narguments: ${toolCall.arguments}`
         : content;
     // Save last 500 chars of the prompt for history context
     const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
@@ -2927,10 +3016,16 @@ const server = http.createServer(async (req, res) => {
             const allowedToolNames = new Set(tools
                 .filter(tool => tool?.type === 'function' && tool.function?.name)
                 .map(tool => tool.function.name));
-            let toolCall = allowedToolNames.size > 0 ? parseToolCall(fullContent) : null;
-            if (toolCall && !allowedToolNames.has(toolCall.name)) {
-                console.log(`${agentTag} Model requested unknown tool ${toolCall.name}; attempting format repair.`);
-                toolCall = null;
+            let toolCall = null;
+            let toolCallPreambleText = '';
+            if (allowedToolNames.size > 0) {
+                const parsed = parseToolCallDetailed(fullContent);
+                if (parsed && !allowedToolNames.has(parsed.toolCall.name)) {
+                    console.log(`${agentTag} Model requested unknown tool ${parsed.toolCall.name}; attempting format repair.`);
+                } else if (parsed) {
+                    toolCall = parsed.toolCall;
+                    toolCallPreambleText = parsed.preamble;
+                }
             }
             
             // Retry once if legacy, XML, or DSML tool markup was truncated or
@@ -2958,12 +3053,13 @@ const server = http.createServer(async (req, res) => {
                 const retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
                 if (retryContent2 && retryContent2.trim()) {
                     repairContent = retryContent2;
-                    const retryTc = parseToolCall(retryContent2);
-                    if (retryTc && allowedToolNames.has(retryTc.name)) {
-                        console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name}`);
+                    const retryParsed = parseToolCallDetailed(retryContent2);
+                    if (retryParsed && allowedToolNames.has(retryParsed.toolCall.name)) {
+                        console.log(`${agentTag} Retry with strict prompt succeeded: ${retryParsed.toolCall.name}`);
                         fullContent = retryContent2;
                         reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
-                        toolCall = retryTc;
+                        toolCall = retryParsed.toolCall;
+                        toolCallPreambleText = retryParsed.preamble;
                         upstreamTokens = retryResult2.upstreamTokens || upstreamTokens;
                     } else {
                         console.log(`${agentTag} Retry still has broken tool markup. Returning a safe error instead of leaking it as text.`);
@@ -3014,15 +3110,17 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            storeHistory(agentId, prompt, fullContent, toolCall);
+            storeHistory(agentId, prompt, fullContent, toolCall, toolCallPreambleText);
             // The remote chat id and message count are final for this turn; make
             // them durable so a restart resumes instead of rebuilding.
             scheduleSessionPersist();
 
             const openaiResponse = toolCall
-                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent, upstreamTokens)
+                ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent, upstreamTokens, toolCallPreambleText)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason, upstreamTokens);
-            console.log(`${agentTag} usage: ${upstreamTokens ? 'upstream' : 'estimate'} prompt=${openaiResponse.usage.prompt_tokens} completion=${openaiResponse.usage.completion_tokens} total=${openaiResponse.usage.total_tokens}`);
+            const usageReport = buildUsageReport(clientPromptText, toolCall ? toolCallPreambleText : fullContent, reasoningContent, upstreamTokens);
+            console.log(`${agentTag} usage: ${usageReport.source} prompt=${openaiResponse.usage.prompt_tokens} completion=${openaiResponse.usage.completion_tokens} total=${openaiResponse.usage.total_tokens}`);
+            if (toolCall && toolCallPreambleText) console.log(`${agentTag} Tool-call preamble: ${toolCallPreambleText.length} chars surfaced as assistant text`);
 
             if (stream) {
                 if (apiMode === 'anthropic') {
@@ -3197,11 +3295,15 @@ module.exports = {
         compactToolSchema,
         formatToolDefinitions,
         parseToolCall,
+        parseToolCallDetailed,
+        toolCallPreamble,
         parseDsmlToolCall,
         looksLikeToolCallMarkup,
         dumpFailedToolMarkup,
         resolveUpstreamUsage,
         buildUsage,
+        buildUsageReport,
+        buildToolCallResponse,
         extractLastUserTurn,
         conversationFingerprint,
         resolveAgentId,

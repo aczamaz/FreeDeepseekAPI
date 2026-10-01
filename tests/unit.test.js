@@ -708,6 +708,12 @@ test('reported reasoning tokens never exceed the reported completion', () => {
   assert.equal(usage.total_tokens, 20);
   assert.ok(usage.completion_tokens_details.reasoning_tokens <= usage.completion_tokens);
   assert.equal(usage.prompt_tokens + usage.completion_tokens, usage.total_tokens);
+  // The wire format carries no bookkeeping fields, and the report labels the
+  // accounting honestly so a non-advancing counter is not logged as upstream.
+  assert.deepEqual(Object.keys(usage).sort(), ['completion_tokens', 'completion_tokens_details', 'prompt_tokens', 'total_tokens']);
+  assert.equal(serverInternals.buildUsageReport('prompt', 'ok', '', { start: 100, total: 120 }).source, 'upstream');
+  assert.equal(serverInternals.buildUsageReport('prompt', 'ok', '', { start: 5, total: 5 }).source, 'estimate');
+  assert.equal(serverInternals.buildUsageReport('prompt', 'ok', '', null).source, 'estimate');
 });
 
 test('session persistence round-trips remote chat ids and drops expired entries', () => {
@@ -1318,6 +1324,94 @@ test('context-compaction header is marked and exposed to browser clients', () =>
 
   assert.equal(headers.get('Access-Control-Expose-Headers'), serverInternals.CONTEXT_COMPACTED_HEADER);
   assert.equal(headers.get(serverInternals.CONTEXT_COMPACTED_HEADER), 'true');
+});
+
+test('the model prose before a tool call is surfaced as assistant text', () => {
+  const dsml = 'Проверю, что стоит на машине.\n\n'
+    + '<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="bash">\n'
+    + '<｜｜DSML｜｜ parameter name="cmd" string="true">ls</｜｜DSML｜｜ parameter>\n'
+    + '</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>';
+  const inline = 'Нашёл microk8s, он остановлен.\n\n{"tool_call":{"name":"bash","arguments":{"cmd":"snap list"}}}';
+  const fenced = 'Смотрю папку.\n\n```json\n{"tool_call":{"name":"bash","arguments":{"cmd":"ls"}}}\n```';
+
+  for (const text of [dsml, inline, fenced]) {
+    const parsed = serverInternals.parseToolCallDetailed(text);
+    assert.equal(parsed.toolCall.name, 'bash', text);
+    assert.ok(parsed.preamble.length > 0, text);
+    assert.equal(parsed.preamble.includes('DSML'), false, text);
+    assert.equal(parsed.preamble.includes('tool_call'), false, text);
+    // parseToolCall keeps its old contract for every existing caller.
+    assert.deepEqual(serverInternals.parseToolCall(text), parsed.toolCall);
+  }
+  assert.match(serverInternals.parseToolCallDetailed(dsml).preamble, /Проверю/);
+  assert.match(serverInternals.parseToolCallDetailed(inline).preamble, /microk8s/);
+
+  // A pure tool call has nothing to show, and a bare JSON example is not a call.
+  const bare = '{"tool_call":{"name":"bash","arguments":{"cmd":"ls"}}}';
+  assert.equal(serverInternals.parseToolCallDetailed(bare).preamble, '');
+  assert.equal(serverInternals.parseToolCallDetailed('For example {"name":"bash","arguments":{}}'), null);
+
+  // Unparsed markup above the executable payload is never surfaced as prose.
+  assert.equal(
+    serverInternals.parseToolCallDetailed(
+      'Try {"tool_call":{"name":"x","arguments":"bad"}} like this:\n\n{"tool_call":{"name":"bash","arguments":{"cmd":"ls"}}}',
+    ).preamble,
+    '',
+  );
+  // Markdown in an explanation is fine: a fence is not a leftover marker.
+  assert.equal(
+    serverInternals.parseToolCallDetailed('Смотри ```ls -la```.\n\n{"tool_call":{"name":"bash","arguments":{"cmd":"ls"}}}').preamble,
+    'Смотри ```ls -la```.',
+  );
+  // A huge explanation is bounded so it cannot flood the transcript.
+  const huge = `${'x'.repeat(20000)}\n\n{"tool_call":{"name":"bash","arguments":{"cmd":"ls"}}}`;
+  assert.equal(serverInternals.parseToolCallDetailed(huge).preamble.length, 8000);
+});
+
+test('a tool turn carries its preamble in content and in the stream', () => {
+  const sse = (send) => {
+    const chunks = [];
+    const res = { writeHead: () => {}, write: (d) => chunks.push(d), end: () => {} };
+    send(res);
+    return chunks
+      .filter(c => c.startsWith('data: ') && c !== 'data: [DONE]\n\n')
+      .map(c => JSON.parse(c.slice(6)));
+  };
+
+  const toolCall = { name: 'bash', arguments: '{"cmd":"ls"}' };
+  const withPreamble = serverInternals.buildToolCallResponse(toolCall, 'deepseek-chat', 'p', '', null, 'Проверю папку.');
+  const message = withPreamble.choices[0].message;
+  assert.equal(message.content, 'Проверю папку.');
+  assert.equal(withPreamble.choices[0].finish_reason, 'tool_calls');
+  assert.equal(withPreamble.usage.completion_tokens > 0, true);
+  // Reasoning stays off a tool turn, but the model's own prose does not.
+  assert.equal(message.reasoning_content, undefined);
+
+  const withoutPreamble = serverInternals.buildToolCallResponse(toolCall, 'deepseek-chat', 'p');
+  assert.equal(withoutPreamble.choices[0].message.content, null);
+  assert.equal(withoutPreamble.usage.completion_tokens, 0);
+
+  // Streamed: the explanation arrives as content deltas before the call.
+  const openai = sse(res => serverInternals.sendOpenAIStream(res, withPreamble));
+  const contentDeltas = openai.filter(c => c.choices[0] && c.choices[0].delta && c.choices[0].delta.content);
+  assert.equal(contentDeltas.map(c => c.choices[0].delta.content).join(''), 'Проверю папку.');
+  const toolIndex = openai.findIndex(c => c.choices[0] && c.choices[0].delta.tool_calls);
+  const lastContentIndex = openai.findLastIndex(c => c.choices[0] && c.choices[0].delta && c.choices[0].delta.content);
+  assert.ok(lastContentIndex < toolIndex, 'preamble must be streamed before tool_calls');
+  assert.equal(openai.at(-1).choices[0], undefined, 'the last chunk carries usage only');
+  assert.equal(openai.some(c => c.choices[0] && c.choices[0].finish_reason === 'tool_calls'), true);
+  assert.equal(sse(res => serverInternals.sendOpenAIStream(res, withoutPreamble))
+    .some(c => c.choices[0] && c.choices[0].delta && c.choices[0].delta.content), false);
+
+  // Responses API: a message item ahead of the function_call item.
+  const responses = sse(res => serverInternals.sendResponsesStream(res, withPreamble));
+  const added = responses.filter(c => c.type === 'response.output_item.added').map(c => c.item.type);
+  assert.deepEqual(added, ['message', 'function_call']);
+  assert.deepEqual(
+    sse(res => serverInternals.sendResponsesStream(res, withoutPreamble))
+      .filter(c => c.type === 'response.output_item.added').map(c => c.item.type),
+    ['function_call'],
+  );
 });
 
 test('stream helpers preserve the request-level exact CORS origin', () => {
