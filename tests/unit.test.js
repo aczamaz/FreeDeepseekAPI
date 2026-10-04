@@ -448,6 +448,63 @@ test('parseToolCall repairs envelopes the stream cut short', () => {
   assert.equal(serverInternals.parseToolCall('prose {"a": [1, 2'), null);
 });
 
+// DeepSeek ships upstream-protocol changes without notice. Each of these streams
+// produced a 0-char answer ("Got 0 chars ... in 20s", then empty_response) under
+// an older parser that hardcoded the fragment layout, while DeepSeek had in fact
+// streamed the full answer.
+test('the SSE accumulator reads content from any fragment index, not just -1', () => {
+  const acc = serverInternals.createDeepSeekStreamAccumulator();
+  const feed = (raw) => raw.split('\n').forEach(line => acc.handleLine(line));
+
+  // Reasoning sits at index 0, answer text at index 1 — and upstream addresses it
+  // explicitly instead of via the usual -1 alias.
+  feed([
+    'data: {"response_message_id":"m1","p":"response/fragments","v":[{"type":"THINK","content":"let me think"},{"type":"RESPONSE","content":""}]}',
+    'data: {"p":"response/fragments/1/content","v":"Hello"}',
+    'data: {"p":"response/fragments/1/content","v":", world"}',
+    'data: {"p":"response/finish_reason","v":"stop"}',
+  ].join('\n'));
+
+  const result = acc.result();
+  assert.equal(result.content, 'Hello, world');
+  assert.equal(result.reasoningContent, 'let me think');
+  assert.equal(result.finishReason, 'stop');
+});
+
+test('the SSE accumulator keeps content when upstream never seeds a fragments array', () => {
+  const acc = serverInternals.createDeepSeekStreamAccumulator();
+  const feed = (raw) => raw.split('\n').forEach(line => acc.handleLine(line));
+
+  // No initial fragments payload at all. The old parser gated the per-token append
+  // on a non-empty fragments array and silently discarded the whole answer.
+  feed([
+    'data: {"response_message_id":"m1","p":"response/fragments/-1/content","v":"direct text"}',
+  ].join('\n'));
+
+  const result = acc.result();
+  assert.equal(result.content, 'direct text');
+  assert.equal(result.messageId, 'm1');
+});
+
+test('the SSE accumulator keeps fragments with an unknown or missing type', () => {
+  const feedInto = (acc, lines) => lines.forEach(line => acc.handleLine(line));
+
+  // A brand-new fragment type, then streamed tokens.
+  const acc = serverInternals.createDeepSeekStreamAccumulator();
+  feedInto(acc, [
+    'data: {"response_message_id":"m1","p":"response/fragments","v":[{"type":"RESPONSE_V2","content":"new type"}]}',
+    'data: {"p":"response/fragments/-1/content","v":" and typeless"}',
+  ]);
+  assert.equal(acc.result().content, 'new type and typeless');
+
+  // A fragment with no type field at all.
+  const acc2 = serverInternals.createDeepSeekStreamAccumulator();
+  feedInto(acc2, [
+    'data: {"response_message_id":"m2","p":"response/fragments","v":[{"content":"no type field"}]}',
+  ]);
+  assert.equal(acc2.result().content, 'no type field');
+});
+
 test('the SSE accumulator keeps the final line that carries no trailing newline', () => {
   // DeepSeek terminates the stream without a final newline. That last `data:`
   // line holds the tail of the answer, the finish_reason and the token totals;
@@ -968,8 +1025,30 @@ test('stream rate limit cools the account down with escalating backoff', () => {
   assert.ok(account.cooldownUntil - Date.now() <= 10 * 60 * 1000);
 });
 
+test('a suspected throttle holds briefly and never feeds the escalation streak', () => {
+  const account = { id: 'rl2', cooldownUntil: 0, failures: 0, rateLimitStreak: 0 };
+  const briefSec = Math.ceil(serverInternals.INFERRED_THROTTLE_COOLDOWN_MS / 1000);
+  assert.ok(briefSec < Math.ceil(serverInternals.RATE_LIMIT_COOLDOWN_MS / 1000), 'must be shorter than a confirmed throttle');
+
+  // An empty stream with no message id is a guess, not proof: short hold, and the
+  // streak stays at zero so repeated guesses cannot escalate into a 10-minute block.
+  assert.equal(serverInternals.markRateLimited(account, 'empty response stream', { explicit: false }), briefSec);
+  assert.equal(account.rateLimitStreak, 0);
+  assert.ok(account.cooldownUntil > Date.now());
+
+  // Once DeepSeek states the throttle outright, escalation behaves as before.
+  const confirmed = serverInternals.markRateLimited(account, 'Слишком частые сообщения');
+  assert.equal(account.rateLimitStreak, 1);
+  assert.equal(confirmed, Math.ceil(serverInternals.RATE_LIMIT_COOLDOWN_MS / 1000));
+});
+
 test('a new chat starts from a smaller prompt budget than a live one', () => {
-  assert.equal(serverInternals.FRESH_SESSION_PROMPT_CHARS, 24000);
+  // 12000 is what the endpoint tolerates as a chat seed: at 24000 the first message
+  // of a tool-heavy turn came back empty. Must also stay above the floor, or the
+  // fresh-session lever would be clamped back up and do nothing.
+  assert.equal(serverInternals.FRESH_SESSION_PROMPT_CHARS, 12000);
+  assert.ok(serverInternals.FRESH_SESSION_PROMPT_CHARS < serverInternals.MAX_UPSTREAM_PROMPT_CHARS);
+  assert.ok(serverInternals.FRESH_SESSION_PROMPT_CHARS > 8000);
   const big = `TASK\n${'x'.repeat(120000)}\nTAIL`;
   const fresh = serverInternals.buildBoundedPrompt('sys', '', big, serverInternals.FRESH_SESSION_PROMPT_CHARS);
   assert.equal(fresh.compacted, true);
@@ -1045,6 +1124,124 @@ test('empty-response retry keeps recovery history unless a smaller global cap re
   assert.match(smallerRetry.prompt, /LATEST_RESULT/);
 });
 
+test('retry budget shrinks from the prompt that failed instead of the global cap', () => {
+  // The 22k case from the field log: budgeting the retry from the 80k global cap
+  // produced a byte-identical request, so an empty response cost three uploads.
+  const failed = 22250;
+  const first = serverInternals.buildRetryBudget(failed, 1);
+  const second = serverInternals.buildRetryBudget(first, 2);
+
+  assert.ok(first < failed, `${first} must be smaller than ${failed}`);
+  assert.ok(second < first, `${second} must be smaller than ${first}`);
+  assert.ok(first >= Math.floor(failed * 0.2), 'never cuts below 20% of the failed prompt');
+
+  // A prompt already small enough to be retried as-is is never truncated: cutting
+  // it cannot fix an empty response, it only discards the task the retry needs.
+  assert.equal(serverInternals.buildRetryBudget(500, 1), 500);
+  assert.equal(serverInternals.buildRetryBudget(serverInternals.MIN_SHRINKABLE_PROMPT_CHARS, 1), serverInternals.MIN_SHRINKABLE_PROMPT_CHARS);
+  // Unknown size keeps the old global behaviour rather than collapsing to nothing.
+  assert.equal(serverInternals.buildRetryBudget(0, 1), 80000);
+});
+
+test('a retry budget covers the injected tool definitions, not just the conversation', () => {
+  // Reproduces the field failure: a tool-heavy turn where the conversation is only
+  // 3841 chars but the system prompt adds ~22k of tool markup. Budgeting from the
+  // conversation alone gave the retry a 2305-char ceiling, which cut the tool
+  // definitions out of the prompt entirely and made every retry fail.
+  const toolMarkup = `## tool\n${'x'.repeat(21876)}`;
+  const conversation = 'User: do the thing';
+  const assembled = serverInternals.assembledPromptLength(toolMarkup, '', conversation);
+
+  assert.equal(assembled, toolMarkup.length + 2 + conversation.length);
+
+  const initial = serverInternals.buildBoundedPrompt(toolMarkup, '', conversation, 24000);
+  assert.ok(initial.prompt.length <= 24000);
+
+  const budget = serverInternals.buildRetryBudget(assembled, 1);
+  assert.ok(budget > conversation.length * 4, `budget ${budget} is too small to keep any tool definitions`);
+
+  const retry = serverInternals.buildRetryPrompt(toolMarkup, '', conversation, initial.prompt, budget);
+  assert.ok(retry.prompt.length <= budget);
+  assert.ok(retry.prompt.length > 10000, `retry collapsed to ${retry.prompt.length} chars`);
+  assert.ok(retry.prompt.includes(toolMarkup.substring(0, 500)), 'tool definitions survived the retry');
+  assert.match(retry.prompt, /do the thing/);
+});
+
+test('a delta-only retry is not reported as context compaction', () => {
+  const system = 'SYSTEM';
+  const delta = 'User: follow up';
+  const fullTranscript = `User: original task\n${'x'.repeat(20000)}\nAssistant: long answer`;
+  const initial = serverInternals.buildBoundedPrompt(system, '', fullTranscript, 80000).prompt;
+
+  // Continuing a live chat sends only the tail: smaller than the failed prompt,
+  // but nothing was dropped, so the client must not be told context was compacted.
+  const deltaRetry = serverInternals.buildRetryPrompt(system, '', delta, initial, 80000, false);
+  assert.equal(deltaRetry.compacted, false);
+  assert.match(deltaRetry.prompt, /follow up/);
+  assert.ok(deltaRetry.prompt.length < initial.length);
+
+  // Replaying the transcript into a recreated chat really does shrink it.
+  const replayRetry = serverInternals.buildRetryPrompt(system, '', fullTranscript, initial, 4000);
+  assert.equal(replayRetry.compacted, true);
+});
+
+test('an empty stream with no message id is classified as a throttled turn', () => {
+  // DeepSeek answers a refused turn with HTTP 200 and no response object at all.
+  assert.equal(
+    serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: '', messageId: null, modelError: null }),
+    true,
+  );
+
+  // A real turn always carries a message id, even when it has no text yet.
+  assert.equal(serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: '', messageId: 7, modelError: null }), false);
+  assert.equal(serverInternals.isSilentUpstreamRejection({ content: 'hi', reasoningContent: '', messageId: 7, modelError: null }), false);
+  assert.equal(serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: 'thinking', messageId: 7, modelError: null }), false);
+  // An explicit error event is already classified, so it must not be double-counted.
+  assert.equal(serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: '', messageId: null, modelError: { type: 'error', content: 'boom' } }), false);
+});
+
+test('one turn at a time per conversation, independent across conversations', async () => {
+  const order = [];
+  const turn = (agentId, label, holdMs) => (async () => {
+    const lock = await serverInternals.acquireAgentTurnLock(agentId, 5000);
+    order.push(`${label}:start`);
+    await new Promise(r => setTimeout(r, holdMs));
+    order.push(`${label}:end`);
+    lock.release();
+  })();
+
+  const a1 = turn('conv-a', 'a1', 40);
+  const a2 = turn('conv-a', 'a2', 0);
+  const b1 = turn('conv-b', 'b1', 0);
+  await Promise.all([a1, a2, b1]);
+
+  // The second turn of the same conversation waits for the first to release,
+  // otherwise it would continue from a parent id the first turn just moved past.
+  assert.ok(order.indexOf('a1:end') < order.indexOf('a2:start'), order.join(' '));
+  // A different conversation is never blocked.
+  assert.ok(order.indexOf('b1:start') < order.indexOf('a1:end'), order.join(' '));
+});
+
+test('a conversation queued past its budget is rejected instead of piling up', async () => {
+  const first = await serverInternals.acquireAgentTurnLock('conv-busy', 5000);
+  let settled = false;
+  const queued = serverInternals.acquireAgentTurnLock('conv-busy', 0).then(
+    () => { settled = true; },
+    (err) => { settled = true; throw err; },
+  );
+
+  // The queue wait is only judged once the turn ahead of it finishes, so the
+  // second request is still parked rather than answered while it waits.
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(settled, false);
+  first.release();
+  await assert.rejects(queued, (err) => err.status === 429 && err.type === 'rate_limit');
+
+  // The rejected attempt must not leave the conversation locked.
+  const after = await serverInternals.acquireAgentTurnLock('conv-busy', 5000);
+  after.release();
+});
+
 test('fresh-session retry restores local history that a healthy remote session initially omitted', () => {
   const system = 'SYSTEM';
   const history = serverInternals.buildRecoveryHistoryPrefix([
@@ -1100,7 +1297,7 @@ test('short sticky cooldown waits it out and preserves the remote session', asyn
     {
       id: 'cooling',
       config: { token: 'one', cookie: 'one' },
-      cooldownUntil: Date.now() + 40,
+      cooldownUntil: Date.now() + 120,
       headers: {},
       nextSlotAt: 0,
     },
@@ -1234,8 +1431,12 @@ test('upstream pacing jitter only ever lengthens the gap', async () => {
 });
 
 test('default upstream pacing leaves a wide, jittered gap', () => {
-  assert.equal(serverInternals.MIN_REQUEST_INTERVAL_MS, 5000);
+  // 8000 + 0..2000 jitter = the 8-10s gap the web endpoint tolerates per account.
+  // Dropping back to 5000 brought back "Слишком частые сообщения" and its 5→10min
+  // cooldown escalation, so the floor is asserted here on purpose.
+  assert.equal(serverInternals.MIN_REQUEST_INTERVAL_MS, 8000);
   assert.equal(serverInternals.REQUEST_JITTER_MS, 2000);
+  assert.ok(serverInternals.MIN_REQUEST_INTERVAL_MS + serverInternals.REQUEST_JITTER_MS >= 8000);
 });
 
 test('cross-account continuation is accepted only with a fresh recovery prompt', () => {

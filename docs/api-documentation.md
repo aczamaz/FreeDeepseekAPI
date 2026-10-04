@@ -435,6 +435,20 @@ Rules:
 - `reasoning_tokens` has no upstream counterpart and stays an estimate, clamped to the reported completion.
 - Set `DEEPSEEK_DEBUG_STREAM=1` to log the stream's JSON-patch paths and dump the raw stream to `$TMPDIR/deepseek_stream_*.jsonl` when investigating usage.
 
+### Upstream protocol changes
+
+DeepSeek ships SSE changes without notice, so the parser deliberately avoids pinning the fragment layout. Three details used to be hardcoded and each turned a fully generated answer into `0 chars`:
+
+| Assumption | Failure |
+|---|---|
+| Content arrives only at `response/fragments/-1/content` | Any other index dropped every token |
+| The per-token append requires a pre-seeded `fragments` array | A stream without that seed was discarded silently |
+| Output fragments are exactly `type: RESPONSE` / `SEARCH` | A renamed, new or typeless fragment type was filtered out of the answer |
+
+Content is now resolved by fragment index (negatives mean "from the end"), a missing fragment is created on the fly, and reasoning types are the only ones excluded from the answer. A new fragment type therefore surfaces as text instead of as an empty reply.
+
+If a response still arrives with a message id but no content and no reasoning, the proxy dumps that stream automatically to `$TMPDIR/deepseek_stream_*_EMPTY.jsonl` and logs `[stream-debug] EMPTY ANSWER` — that dump is the diagnostic evidence for the next protocol change. Healthy traffic writes no files.
+
 ---
 
 ## 4. Multi-Agent Session Isolation
@@ -575,15 +589,17 @@ The parser traverses character by character tracking brace depth:
 | Message count >= `DEEPSEEK_MAX_MESSAGE_DEPTH` (default 100) | Auto-reset DeepSeek session, keep history buffer |
 | Session age > `DEEPSEEK_SESSION_TTL_MS` (default 6 hours) | Auto-reset (configurable; recovery history covers upstream TTL) |
 | HTTP 400/404/500 response | Reset and retry once (chat is genuinely dead) |
-| Empty content response | Retry once on the **same** chat with a smaller prompt; only a second empty response resets the session (`DEEPSEEK_MAX_RETRIES`, default 2) |
+| Empty content response | Retry once on the **same** chat, sending only the delta tail; only a second empty response replays the transcript into a recreated chat (`DEEPSEEK_MAX_RETRIES`, default 2) |
+| Empty stream with **no `message_id`** | DeepSeek refused the turn instead of answering it (often in ~1s). Not retried at all; the account is held for `DEEPSEEK_INFERRED_THROTTLE_COOLDOWN_MS` (default 30s) *without* touching the escalation streak, and the client gets 429 + `Retry-After`. Only an explicit "Слишком частые сообщения" escalates to `DEEPSEEK_RATE_LIMIT_COOLDOWN_MS` |
 | Request timeout | **Session kept** — only the local wall-clock budget expired; the remote chat stays valid |
 | Context/content too long | Pre-compact to `DEEPSEEK_MAX_PROMPT_CHARS`, then retry with a smaller budget |
 | Malformed tool-call markup | One repair retry on the **same** session with a strict format instruction; if that also fails → `502 malformed_tool_call`, remote chat **reset** (local history and sticky account kept) and the raw model output saved to `$TMPDIR/deepseek_response_*`, so the client's next request starts a clean chat instead of replaying the same failure |
 | Sticky account cooling down after 429 | Wait up to `DEEPSEEK_STICKY_WAIT_MS` (default 60s), else 429 + Retry-After — session is **not** reset |
-| Same-account request bursts | Paced by `DEEPSEEK_MIN_REQUEST_INTERVAL_MS` (default 5000ms) plus `DEEPSEEK_REQUEST_JITTER_MS` (default 0-2000ms) to reduce 429s |
+| Same-account request bursts | Paced by `DEEPSEEK_MIN_REQUEST_INTERVAL_MS` (default 8000ms) plus `DEEPSEEK_REQUEST_JITTER_MS` (default 0-2000ms), i.e. an 8-10s gap between turns. Below ~8s the endpoint answers "Слишком частые сообщения" inside a 200 stream and escalates into a 5- then 10-minute block |
+| Two requests for the same conversation at once | Serialized: the second waits for the first to finish before it reads `parent_message_id`, because a DeepSeek chat can only be advanced one turn at a time. Different conversations stay fully parallel. A turn that waits longer than the remaining request budget gets 429 + `Retry-After` instead of queueing |
 | Calls inside one turn (PoW, session create, completion) | Separated by `DEEPSEEK_UPSTREAM_CALL_GAP_MS` (default 700ms) |
 | "Sending too often" as a stream error inside HTTP 200 | Account cooled down (`DEEPSEEK_RATE_LIMIT_COOLDOWN_MS`, default 5 min, doubling per repeat, capped by `DEEPSEEK_ACCOUNT_COOLDOWN_MS`); session **preserved**; client gets 429 + `Retry-After`. Add a second auth file to the default `data/accounts/` pool (`npm run auth`) or wait it out — this notice is an account-level throttle |
-| Oversized first message on a new chat | New sessions use `DEEPSEEK_FRESH_SESSION_PROMPT_CHARS` (default 24000) instead of the live-session budget |
+| Oversized first message on a new chat | New sessions use `DEEPSEEK_FRESH_SESSION_PROMPT_CHARS` (default 12000) instead of the live-session budget; the tool markup absorbs the cut and the task is preserved. Only the first message is affected — later turns use `DEEPSEEK_MAX_PROMPT_CHARS` |
 
 ### 6.2 History Buffer
 
@@ -632,7 +648,7 @@ const MAX_UPSTREAM_PROMPT_CHARS = 80000; // Configurable via DEEPSEEK_MAX_PROMPT
 const SESSION_TTL_MS = Number(process.env.DEEPSEEK_SESSION_TTL_MS || 6 * 60 * 60 * 1000); // 6 hours
 const DS_FETCH_TIMEOUT_MS = Number(process.env.DEEPSEEK_FETCH_TIMEOUT_MS || 180000);
 const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 300000);
-const MIN_REQUEST_INTERVAL_MS = Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 5000); // pacing
+const MIN_REQUEST_INTERVAL_MS = Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 8000); // pacing
 const REQUEST_JITTER_MS = Number(process.env.DEEPSEEK_REQUEST_JITTER_MS ?? 2000); // anti-burst spread
 const UPSTREAM_CALL_GAP_MS = Number(process.env.DEEPSEEK_UPSTREAM_CALL_GAP_MS ?? 700);
 const RATE_LIMIT_COOLDOWN_MS = Number(process.env.DEEPSEEK_RATE_LIMIT_COOLDOWN_MS || 60000);

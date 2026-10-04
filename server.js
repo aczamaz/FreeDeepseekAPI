@@ -166,7 +166,13 @@ const REQUEST_DEADLINE_MS = Number(process.env.DEEPSEEK_REQUEST_DEADLINE_MS || 3
 const MAX_CONCURRENT = Number(process.env.DEEPSEEK_MAX_CONCURRENT || 24);
 // Minimum pause between logical upstream requests on the same account. Spaces out
 // PoW + session-create + completion bursts so DeepSeek is less likely to 429.
-const MIN_REQUEST_INTERVAL_MS = Math.max(0, Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 5000));
+// Minimum pause between logical upstream requests on the same account. Spaces out
+// PoW + session-create + completion bursts so DeepSeek is less likely to 429.
+// 8000 (+ up to 2000ms jitter) is what the web endpoint tolerates for a single
+// account: at 5000 it started answering "Слишком частые сообщения" inside a 200
+// stream, which then escalated to a 5- then 10-minute block. Raise it further
+// before adding accounts — a stalled account blocks its whole conversation.
+const MIN_REQUEST_INTERVAL_MS = Math.max(0, Number(process.env.DEEPSEEK_MIN_REQUEST_INTERVAL_MS ?? 8000));
 // Extra random pause (0..this) added on top of the interval so several agents
 // never march upstream in lockstep and look like a scripted burst.
 const REQUEST_JITTER_MS = Math.max(0, Number(process.env.DEEPSEEK_REQUEST_JITTER_MS ?? 2000));
@@ -178,6 +184,12 @@ const UPSTREAM_CALL_GAP_MS = Math.max(0, Number(process.env.DEEPSEEK_UPSTREAM_CA
 // Long by default: this notice is an account-level throttle, not a 1s burst, so
 // retrying within a minute only extends the block.
 const RATE_LIMIT_COOLDOWN_MS = Math.max(1000, Number(process.env.DEEPSEEK_RATE_LIMIT_COOLDOWN_MS || 300000));
+// A stream that came back with no response object at all is only a *suspected*
+// throttle: DeepSeek also answers an aborted or hiccupped turn that way. It gets a
+// short hold that never feeds the escalation streak, so one unlucky upstream hiccup
+// cannot park an account for ten minutes. An account that really is throttled says so
+// explicitly ("Слишком частые сообщения") on the next attempt and escalates then.
+const INFERRED_THROTTLE_COOLDOWN_MS = Math.max(1000, Number(process.env.DEEPSEEK_INFERRED_THROTTLE_COOLDOWN_MS || 30000));
 // How long to wait for a sticky account that is cooling down (e.g. after 429)
 // before giving up with 429. Waiting preserves the remote chat session instead
 // of rotating accounts and forcing a brand-new chat.
@@ -186,18 +198,27 @@ const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
 const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
     ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
     : 2;
-const MIN_UPSTREAM_PROMPT_CHARS = 16000;
+// Floor for both prompt caps. It has to sit below the fresh-session cap, otherwise
+// a configured DEEPSEEK_FRESH_SESSION_PROMPT_CHARS below this value is silently
+// clamped back up and the fresh-session lever does nothing.
+const MIN_UPSTREAM_PROMPT_CHARS = 8000;
+// Below this assembled size a retry prompt is left intact — see buildRetryBudget.
+const MIN_SHRINKABLE_PROMPT_CHARS = 8000;
 const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
 const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
     : 80000;
-// A brand-new chat is the riskiest upstream call: the whole client transcript
-// lands in one first message and DeepSeek can answer it with an abuse notice.
-// New sessions therefore start from a much smaller budget.
+// A brand-new chat is the riskiest upstream call: the whole client transcript plus
+// the injected tool definitions land in one first message, and DeepSeek answers that
+// with an empty stream. New sessions therefore start from a much smaller budget.
+// What gets cut is the tool markup — buildBoundedPrompt hands the unused share of a
+// short conversation back to the system prompt, so the task itself stays intact.
+// 12000 keeps roughly a third of the tool definitions, which is enough for the first
+// turn to call a tool while halving the payload DeepSeek sees as a chat seed.
 const configuredFreshChars = Number(process.env.DEEPSEEK_FRESH_SESSION_PROMPT_CHARS);
 const FRESH_SESSION_PROMPT_CHARS = Number.isFinite(configuredFreshChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredFreshChars))
-    : 24000;
+    : 12000;
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -277,6 +298,17 @@ function accountStatus(account) {
         rate_limit_streak: account.rateLimitStreak || 0,
     };
 }
+// setTimeout is allowed to fire a tick early. Sleeping exactly the remaining
+// cooldown and re-checking the clock would then turn a cooldown that is about to
+// expire into a spurious 429, so wait until the timestamp has really passed.
+async function waitUntilCooldown(timestamp) {
+    for (;;) {
+        const remaining = timestamp - Date.now();
+        if (remaining <= 0) return;
+        await new Promise(r => setTimeout(r, remaining + 5));
+    }
+}
+
 async function selectAccountForSession(session) {
     const now = Date.now();
     if (session.accountId) {
@@ -291,7 +323,7 @@ async function selectAccountForSession(session) {
             const remainingMs = sticky.cooldownUntil - now;
             if (remainingMs <= STICKY_WAIT_MS) {
                 console.log(`[account:${sticky.id}] sticky cooldown ${Math.ceil(remainingMs / 1000)}s ≤ wait cap ${Math.ceil(STICKY_WAIT_MS / 1000)}s; waiting (session preserved)`);
-                await new Promise(r => setTimeout(r, remainingMs));
+                await waitUntilCooldown(sticky.cooldownUntil);
                 if (sticky.cooldownUntil <= Date.now()) return sticky;
             }
             const waitSec = Math.max(1, Math.ceil((sticky.cooldownUntil - Date.now()) / 1000));
@@ -458,6 +490,40 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
         scheduleSessionPersist();
     }
     return removed;
+}
+
+// A DeepSeek chat is strictly sequential: every turn has to name the message it
+// continues from. Two requests for the same conversation running at once both read
+// session.parentMessageId, and the second overwrites it while the first turn is
+// still streaming — the first then continues from a message that is no longer the
+// thread tip, and DeepSeek answers that with an empty stream. Serializing per
+// conversation removes the race; separate conversations stay fully parallel.
+const agentTurnLocks = new Map();
+
+async function acquireAgentTurnLock(agentId, maxQueueMs = REQUEST_DEADLINE_MS) {
+    const previous = agentTurnLocks.get(agentId) || Promise.resolve();
+    let unlock;
+    const held = new Promise(resolve => { unlock = resolve; });
+    agentTurnLocks.set(agentId, held);
+    const queuedAt = Date.now();
+    let startedAt = 0;
+    await previous.then(() => { startedAt = Date.now(); });
+    const queueWaitMs = startedAt - queuedAt;
+    if (queueWaitMs > Math.max(0, maxQueueMs)) {
+        unlock();
+        if (agentTurnLocks.get(agentId) === held) agentTurnLocks.delete(agentId);
+        const waitSec = Math.max(1, Math.ceil((queueWaitMs - Math.max(0, maxQueueMs)) / 1000));
+        const err = new Error(`Conversation is busy with an earlier turn (queued ${Math.round(queueWaitMs / 1000)}s). Retry in ~${waitSec}s.`);
+        err.status = 429; err.retryAfter = Math.min(waitSec, 60); err.type = 'rate_limit';
+        throw err;
+    }
+    return {
+        queueWaitMs,
+        release() {
+            unlock();
+            if (agentTurnLocks.get(agentId) === held) agentTurnLocks.delete(agentId);
+        },
+    };
 }
 
 // === Session persistence ===
@@ -656,10 +722,17 @@ const ALL_MODEL_CAPABILITIES = Object.fromEntries(Object.entries(MODEL_CONFIGS).
     unavailable_reason: cfg.unavailable_reason || null,
 }]));
 
+// Upstream fragment types are not a stable contract: DeepSeek ships new ones and
+// has shipped typeless fragments, and an allowlist of 'RESPONSE'/'SEARCH' made the
+// parser drop the whole answer (0 chars after a full generation) the first time the
+// type changed. Classify reasoning explicitly and treat every other text-carrying
+// fragment as output, so a new or renamed type still reaches the client.
 function isAssistantOutputFragment(fragment) {
-    return fragment
-        && (fragment.type === 'RESPONSE' || fragment.type === 'SEARCH')
-        && typeof fragment.content === 'string';
+    if (!fragment || typeof fragment.content !== 'string') return false;
+    const type = fragment.type;
+    if (type === 'THINK' || type === 'REASONING') return false;
+    if (type === 'SEARCH_INFO' || type === 'SUGGESTION') return false;
+    return true;
 }
 
 function isReasoningFragment(fragment) {
@@ -792,12 +865,26 @@ function createDeepSeekStreamAccumulator() {
             }
             applyResponsePatchOperations(d.v, appendFragments);
         }
-        if (state.lastPath === 'response/fragments/-1/content' && d.v !== undefined && typeof d.v !== 'object') {
-            if (state.fragments.length > 0) {
-                const lastFragment = state.fragments[state.fragments.length - 1];
-                lastFragment.content = `${lastFragment.content || ''}${d.v}`;
-                rebuild();
+        // Streamed content arrives as one patch per token at
+        // response/fragments/<index>/content. The index used to be pinned to -1
+        // (which means "last fragment"); a layout change (text moving to index 0,
+        // or a reasoning fragment taking -1) used to drop every token and yield a
+        // 0-char answer. Resolve the target by index — negatives relative to the
+        // end, as upstream means them — and create it when never seeded.
+        const contentPatch = /^(?:response\/)?fragments\/(-?\d+)\/content$/.exec(state.lastPath || '');
+        if (contentPatch && d.v !== undefined && typeof d.v !== 'object') {
+            const rawIndex = Number(contentPatch[1]);
+            // -1 means "last fragment"; a negative slot must never be used as an
+            // array key, because Array.prototype.filter skips holes and the text
+            // would be lost again — so it resolves to the current end.
+            const index = rawIndex < 0 ? state.fragments.length + rawIndex : rawIndex;
+            let fragment = state.fragments[index];
+            if (!fragment) {
+                fragment = { type: 'RESPONSE', content: '' };
+                state.fragments[index < 0 ? state.fragments.length : index] = fragment;
             }
+            fragment.content = `${fragment.content || ''}${d.v}`;
+            rebuild();
         }
         if (state.lastPath === 'response/content' && d.v !== undefined && typeof d.v !== 'object') {
             state.content += d.v;
@@ -2340,16 +2427,65 @@ function buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, max
     };
 }
 
-function buildRetryPrompt(systemPrompt, historyPrefix, conversationPrompt, currentPrompt, maxChars) {
+// `treatShrinkAsCompaction` is false when the retry sends less than the failed
+// prompt on purpose — a delta-only retry on a live chat is smaller because the
+// chat already holds the earlier turns, not because context was dropped. Flagging
+// that as compaction would make the client believe it lost context and resend it.
+function buildRetryPrompt(systemPrompt, historyPrefix, conversationPrompt, currentPrompt, maxChars, treatShrinkAsCompaction = true) {
     const retryBuild = buildBoundedPrompt(systemPrompt, historyPrefix, conversationPrompt, maxChars);
     const current = String(currentPrompt || '');
     return {
         ...retryBuild,
-        compacted: retryBuild.compacted || retryBuild.prompt.length < current.length,
+        compacted: retryBuild.compacted || (treatShrinkAsCompaction && retryBuild.prompt.length < current.length),
         originalChars: retryBuild.originalChars,
         promptChars: retryBuild.prompt.length,
         previousPromptChars: current.length,
     };
+}
+
+// A retry is only worth an upstream call if it asks DeepSeek something new. The
+// budget used to be a share of DEEPSEEK_MAX_PROMPT_CHARS, so whenever the failed
+// prompt already fit inside that share the retry was byte-identical to the attempt
+// that had just failed: three identical uploads per empty response, which is
+// exactly what drives the account into "sending too often". Sizing the budget from
+// the prompt that actually failed makes every retry a different, smaller request.
+function buildRetryBudget(sourceChars, retryAttempt) {
+    const current = Math.max(0, Math.floor(Number(sourceChars) || 0));
+    if (current <= 0) return MAX_UPSTREAM_PROMPT_CHARS;
+    const attempt = Math.max(1, Math.floor(Number(retryAttempt) || 1));
+    // Shrinking only makes sense when size is what DeepSeek choked on. A prompt
+    // this small is retried as-is: truncating it cannot fix an empty response and
+    // only throws away task context the retry needs to succeed.
+    if (current <= MIN_SHRINKABLE_PROMPT_CHARS) return current;
+    const ratio = Math.max(0.4, 0.75 - (attempt - 1) * 0.2);
+    const floor = Math.max(MIN_SHRINKABLE_PROMPT_CHARS, Math.floor(current * 0.2));
+    return Math.max(floor, Math.min(MAX_UPSTREAM_PROMPT_CHARS, Math.floor(current * ratio)));
+}
+
+// The exact length buildBoundedPrompt computes for a triple (server.js:2296). A
+// retry budget has to be derived from this and not from the conversation slice:
+// the injected tool definitions are usually the bulk of the prompt, and budgeting
+// against the conversation alone handed a 26k prompt a 2k budget, which cut the
+// tool definitions out of the retry and made every retry fail for a new reason.
+function assembledPromptLength(systemPrompt, historyPrefix, conversationPrompt) {
+    const system = String(systemPrompt || '').trim();
+    const history = String(historyPrefix || '');
+    const conversation = String(conversationPrompt || '').trim();
+    return (system ? system.length + 2 : 0) + history.length + conversation.length;
+}
+
+// DeepSeek rejects a throttled turn with HTTP 200 and a stream that carries no
+// response object at all — no fragments, no message id, no error event — and
+// often in about a second. That is a refusal, not an unfinished generation, so
+// retrying it only repeats the burst that caused it. Reported as the rate limit
+// it is, so the account is cooled down on the first offence instead of the third.
+function isSilentUpstreamRejection(result) {
+    if (!result) return false;
+    if (result.messageId) return false;
+    if (result.modelError) return false;
+    const content = String(result.content || '').trim();
+    const reasoning = String(result.reasoningContent || '').trim();
+    return content.length === 0 && reasoning.length === 0;
 }
 
 function appendPromptInstruction(promptText, instruction, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
@@ -2386,10 +2522,18 @@ function isRateLimitMessage(error) {
 // Cool an account down after a stream-level rate-limit notice, escalating while
 // the abuse repeats so a single unlucky burst does not park the account for the
 // full cooldown. Returns the cooldown in whole seconds for Retry-After.
-function markRateLimited(account, reason = 'stream rate limit') {
+function markRateLimited(account, reason = 'stream rate limit', { explicit = true } = {}) {
     if (!account) return Math.max(1, Math.ceil(DEFAULT_ACCOUNT_COOLDOWN_MS / 1000));
-    account.rateLimitStreak = (account.rateLimitStreak || 0) + 1;
     account.failures++;
+    // An inferred throttle is a guess, so it only holds the account briefly and
+    // leaves rateLimitStreak alone. Escalating on a guess is what turned a single
+    // empty upstream stream into a 5-minute block, then a 10-minute one.
+    if (!explicit) {
+        account.cooldownUntil = Date.now() + INFERRED_THROTTLE_COOLDOWN_MS;
+        console.log(`[account:${account.id}] suspected throttle (${reason}); brief cooldown ${Math.round(INFERRED_THROTTLE_COOLDOWN_MS / 1000)}s (streak ${account.rateLimitStreak || 0} unchanged)`);
+        return Math.max(1, Math.ceil(INFERRED_THROTTLE_COOLDOWN_MS / 1000));
+    }
+    account.rateLimitStreak = (account.rateLimitStreak || 0) + 1;
     const cooldownMs = Math.min(DEFAULT_ACCOUNT_COOLDOWN_MS, RATE_LIMIT_COOLDOWN_MS * Math.pow(2, account.rateLimitStreak - 1));
     account.cooldownUntil = Date.now() + cooldownMs;
     console.log(`[account:${account.id}] stream rate limit (${reason}); cooldown ${Math.round(cooldownMs / 1000)}s (streak ${account.rateLimitStreak})`);
@@ -2642,6 +2786,7 @@ const server = http.createServer(async (req, res) => {
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
         let activeSession = null;
         let activeAgentId = null;
+        let releaseAgentLock = null;
         try {
             const rawParams = JSON.parse(body || '{}');
             const params = normalizeApiParams(rawParams, apiMode);
@@ -2729,6 +2874,19 @@ const server = http.createServer(async (req, res) => {
             const session = getOrCreateAgentSession(agentId);
             activeSession = session;
 
+            // One turn at a time per conversation, held until the local history is
+            // written: a concurrent request for the same chat would otherwise
+            // continue from a parent id this turn is about to move past.
+            const agentLock = await acquireAgentTurnLock(agentId, REQUEST_DEADLINE_MS - (Date.now() - requestStartedAt));
+            releaseAgentLock = agentLock.release;
+            if (agentLock.queueWaitMs > 1000) {
+                console.log(`${agentTag} waited ${Math.round(agentLock.queueWaitMs / 1000)}s for the previous turn of this conversation to finish`);
+            }
+            // The session object itself is stable (resets mutate it in place), but an
+            // earlier queued turn may have moved the remote chat while this request
+            // waited, so everything below reads it only after the lock is held.
+            session.lastActivityAt = Date.now();
+
             // Roll over TTL/depth-limited sessions before deciding whether to
             // inject local recovery history into the newly built prompt.
             const promptRollover = prepareSessionForPrompt(session);
@@ -2793,8 +2951,8 @@ const server = http.createServer(async (req, res) => {
                     }
                 };
                 const recordDebugLine = (line) => {
-                    if (!debugStream) return;
                     if (debugRaw.length < 5000) debugRaw.push(line);
+                    if (!debugStream) return;
                     let d;
                     try { d = JSON.parse(line.slice(6)); } catch (e) { return; }
                     if (!d || typeof d !== 'object') return;
@@ -2810,11 +2968,22 @@ const server = http.createServer(async (req, res) => {
                     recordDebugLine(line);
                     acc.handleLine(line);
                 };
-                const finishDebugStream = () => {
-                    if (!debugStream) return;
+                // The raw stream is kept in memory even when debug mode is off, because
+                // a 0-char answer with a message id means DeepSeek generated something the
+                // parser did not extract — exactly the case where the protocol changed and
+                // the dump is the only evidence. Dumping automatically on that case stops
+                // the guess loop; there is no cost on healthy traffic.
+                const finishDebugStream = (result) => {
+                    const suspiciousEmpty = !!(result && result.messageId && !result.content && !result.reasoningContent);
+                    if (!debugStream && !suspiciousEmpty) return;
                     try {
-                        const file = path.join(os.tmpdir(), `deepseek_stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jsonl`);
+                        const suffix = suspiciousEmpty && !debugStream ? '_EMPTY' : '';
+                        const file = path.join(os.tmpdir(), `deepseek_stream_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${suffix}.jsonl`);
                         fs.writeFileSync(file, debugRaw.join('\n'));
+                        if (suspiciousEmpty) {
+                            console.log(`[stream-debug] EMPTY ANSWER but message id present — protocol mismatch suspected. Raw stream: ${file}`);
+                            return;
+                        }
                         console.log(`[stream-debug] keys/paths: ${[...debugPaths].sort().join(' ')}`);
                         console.log(`[stream-debug] numeric usage fields: ${debugNumerics.size ? [...debugNumerics].sort().join(' ') : '(none)'}`);
                         console.log(`[stream-debug] raw stream: ${file}`);
@@ -2833,11 +3002,12 @@ const server = http.createServer(async (req, res) => {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
 
-                finishDebugStream();
+                finishDebugStream(result);
                 return result;
             }
 
-            let { content: fullContent, reasoningContent, finishReason, modelError, upstreamTokens } = await readDeepSeekResponse(dsResp.body);
+            const initialResult = await readDeepSeekResponse(dsResp.body);
+            let { content: fullContent, reasoningContent, finishReason, modelError, upstreamTokens } = initialResult;
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
             const elapsed = Date.now() - startTime;
@@ -2847,11 +3017,22 @@ const server = http.createServer(async (req, res) => {
             // remote session with a smaller prompt — an empty response is usually
             // a transient upstream hiccup, not a dead chat. Only a second empty
             // response justifies throwing the chat away.
+            //
+            // A stream that produced no message id at all is excluded: that is the
+            // upstream refusing the turn, and re-sending it only deepens the throttle.
+            let silentRejection = isSilentUpstreamRejection(initialResult);
+            if (silentRejection) {
+                console.log(`${agentTag} upstream returned an empty stream with no message id in ${elapsed}ms — treating it as a throttled turn, not retrying it`);
+            }
+            // Retry payloads are the delta tail on a live chat and the whole transcript on
+            // a recreated one, but both are sent together with the injected tool
+            // definitions, so the budget is measured over the assembled prompt.
             let retryAttempt = 0;
             let keptSessionForRetry = false;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
+                if (silentRejection) break;
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
                 const contextTooLong = isContextTooLongError(modelError);
@@ -2859,20 +3040,38 @@ const server = http.createServer(async (req, res) => {
                 if (retryAttempt >= MAX_EMPTY_RETRIES) break;
                 retryAttempt++;
 
-                const retryRatio = contextTooLong
-                    ? Math.max(0.35, 0.8 - retryAttempt * 0.2)
-                    : Math.max(0.5, 1 - retryAttempt * 0.2);
-                const retryBudget = Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(MAX_UPSTREAM_PROMPT_CHARS * retryRatio));
-                // A retry may run against a recreated chat, so it always carries
-                // the full transcript rather than the delta tail.
-                const retryBuild = buildRetryPrompt(systemPrompt, recoveryHistoryPrefix, recoveryPromptSource, fullPrompt, retryBudget);
+                // Reuse the live chat only when its thread position is known. With a
+                // parent id the chat still holds every turn before the delta tail, so
+                // the retry sends that tail alone; without one the chat already took
+                // the whole transcript as its first message and cannot be continued,
+                // so it gets recreated instead of being fed the transcript twice.
+                const reuseSession = !keptSessionForRetry
+                    && Boolean(session.id)
+                    && session.parentMessageId != null;
+                // Budget from the payload this retry will actually send: the delta tail
+                // when continuing a live chat, the full transcript when recreating one.
+                // Sizing it from the previous attempt instead would clamp a replayed
+                // transcript to the size of the delta that preceded it.
+                const retrySource = reuseSession ? prompt : recoveryPromptSource;
+                const retryHistory = reuseSession ? '' : recoveryHistoryPrefix;
+                const retryBudget = buildRetryBudget(
+                    assembledPromptLength(systemPrompt, retryHistory, retrySource),
+                    retryAttempt,
+                );
+                const retryBuild = buildRetryPrompt(
+                    systemPrompt,
+                    retryHistory,
+                    retrySource,
+                    fullPrompt,
+                    retryBudget,
+                    !reuseSession,
+                );
                 const retryPrompt = retryBuild.prompt;
                 if (retryBuild.compacted) {
                     promptCompacted = true;
                     markContextCompacted(res);
                 }
                 const reason = contextTooLong ? 'context-too-long response' : 'empty response';
-                const reuseSession = !keptSessionForRetry && Boolean(session.id);
                 if (reuseSession) {
                     keptSessionForRetry = true;
                     console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Retrying on the same session...`);
@@ -2893,6 +3092,12 @@ const server = http.createServer(async (req, res) => {
                 // A previous empty response may have carried finish_reason=length.
                 // Never leak it into a successful retry that supplied no reason.
                 finishReason = retryState.finishReason;
+                if (isSilentUpstreamRejection(retryResult)) {
+                    // Same signature as the first attempt: the account is refusing
+                    // turns, so a further retry would only add to the burst.
+                    silentRejection = true;
+                    break;
+                }
                 if (retryState.content && retryState.content.trim().length > 0) {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
                     fullContent = retryState.content;
@@ -2902,22 +3107,29 @@ const server = http.createServer(async (req, res) => {
 
             if (!fullContent || fullContent.trim().length === 0) {
                 const timedOut = deadlineHit();
-                // "Sending too often" arrives as a stream error inside HTTP 200.
-                // Cool the account down, keep the chat, and let the client retry —
-                // resetting here is what used to spawn a new chat per complaint.
-                if (isRateLimitMessage(modelError)) {
+                // "Sending too often" arrives as a stream error inside HTTP 200, and a
+                // throttled turn can also come back as a stream with no response object
+                // in it at all. Cool the account down, keep the chat, and let the client
+                // retry — resetting here is what used to spawn a new chat per complaint.
+                if (silentRejection || isRateLimitMessage(modelError)) {
                     const limitedAccount = accounts.find(a => a.id === session.accountId) || null;
-                    const retryAfterSec = markRateLimited(limitedAccount, String(modelError?.content || '').slice(0, 80));
+                    const notice = silentRejection
+                        ? 'empty response stream, no message id'
+                        : String(modelError?.content || '').slice(0, 80);
+                    const retryAfterSec = markRateLimited(limitedAccount, notice, { explicit: !silentRejection });
                     console.log(`${agentTag} rate limited by DeepSeek; session ${session.id} preserved, retry in ${retryAfterSec}s.`);
                     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(retryAfterSec) });
                     res.end(JSON.stringify({
                         error: {
-                            message: `DeepSeek throttled this auth account ("${String(modelError?.content || 'too many requests').substring(0, 120)}"). The chat was kept — retry in ~${retryAfterSec}s. If it keeps happening, the account itself is rate-limited: add a second account (npm run auth:import, DEEPSEEK_AUTH_DIR=./accounts) or wait it out.`,
+                            message: silentRejection
+                                ? `DeepSeek refused this turn with an empty response stream (no message id) — usually a short throttle or an aborted upstream generation. The chat was kept; retry in ~${retryAfterSec}s.`
+                                : `DeepSeek throttled this auth account ("${String(modelError?.content || 'too many requests').substring(0, 120)}"). The chat was kept — retry in ~${retryAfterSec}s. If it keeps happening, the account itself is rate-limited: add a second account (npm run auth:import, DEEPSEEK_AUTH_DIR=./accounts) or wait it out.`,
                             type: 'rate_limit_error',
                             agent: agentId,
                             session_preserved: true,
                             account: session.accountId,
                             retry_after_sec: retryAfterSec,
+                            suspected_throttle: silentRejection,
                             model: requestedModel,
                             real_model: resolveModelConfig(requestedModel).real_model,
                         }
@@ -3173,6 +3385,7 @@ const server = http.createServer(async (req, res) => {
                 } : {}),
             } }));
         } finally {
+            if (releaseAgentLock) releaseAgentLock();
             inFlight--;
         }
     });
@@ -3316,6 +3529,11 @@ module.exports = {
         buildRecoveryHistoryPrefix,
         buildBoundedPrompt,
         buildRetryPrompt,
+        buildRetryBudget,
+        assembledPromptLength,
+        MIN_SHRINKABLE_PROMPT_CHARS,
+        isSilentUpstreamRejection,
+        acquireAgentTurnLock,
         isContinuationRecoverySafe,
         isContextTooLongError,
         normalizeRetryResponse,
@@ -3344,7 +3562,10 @@ module.exports = {
         REQUEST_JITTER_MS,
         UPSTREAM_CALL_GAP_MS,
         RATE_LIMIT_COOLDOWN_MS,
+        INFERRED_THROTTLE_COOLDOWN_MS,
         FRESH_SESSION_PROMPT_CHARS,
+        MAX_UPSTREAM_PROMPT_CHARS,
+        MIN_UPSTREAM_PROMPT_CHARS,
         STICKY_WAIT_MS,
         MAX_MESSAGE_DEPTH,
         SESSION_TTL_MS,
