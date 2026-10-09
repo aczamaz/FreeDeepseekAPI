@@ -1681,11 +1681,17 @@ function parseToolCallDetailed(text) {
         if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, xmlMatch.index) };
     }
 
-    // Fenced JSON blocks.
+    // Fenced JSON blocks. A reply often contains ```bash / ```yaml blocks that
+    // merely show a command to the user, so every fence used to be fed to
+    // JSON.parse and logged a failure that meant nothing. A JSON envelope always
+    // starts with { or [, so anything else cannot be a tool call — skip it
+    // silently instead of reporting a bogus parse error.
     const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
+        const fenced = fence[1].trim();
+        if (!/^[[{]/.test(fenced)) continue;
+        const tc = parseJsonToolCandidate(fenced, 'fenced');
         if (tc) return { toolCall: tc, preamble: toolCallPreamble(text, fence.index) };
     }
 
@@ -2475,10 +2481,9 @@ function assembledPromptLength(systemPrompt, historyPrefix, conversationPrompt) 
 }
 
 // DeepSeek rejects a throttled turn with HTTP 200 and a stream that carries no
-// response object at all — no fragments, no message id, no error event — and
-// often in about a second. That is a refusal, not an unfinished generation, so
-// retrying it only repeats the burst that caused it. Reported as the rate limit
-// it is, so the account is cooled down on the first offence instead of the third.
+// response object at all — no fragments, no message id, no error event. Reported
+// as the rate limit it is, so the account is cooled down on the first offence
+// instead of the third.
 function isSilentUpstreamRejection(result) {
     if (!result) return false;
     if (result.messageId) return false;
@@ -2486,6 +2491,23 @@ function isSilentUpstreamRejection(result) {
     const content = String(result.content || '').trim();
     const reasoning = String(result.reasoningContent || '').trim();
     return content.length === 0 && reasoning.length === 0;
+}
+
+// An empty stream with no message id is not one event but two, and they need
+// opposite handling — the old code treated both as a throttle and never retried,
+// so an aborted generation surfaced to the client as a 429 it had to handle.
+// Elapsed time separates them, because it is the one signal that says whether
+// DeepSeek ever started generating: a refusal lands in about a second, while a
+// generation that was aborted mid-flight had already been working for seconds.
+//   throttle — refused up front. Retrying immediately repeats the burst, so the
+//              cooldown has to be served first.
+//   aborted  — started and then dropped. Ordinary empty response, so it goes
+//              through the normal retry-on-the-same-session path.
+const SILENT_REJECTION_MIN_GENERATION_MS = 2500;
+
+function classifySilentUpstreamRejection(result, elapsedMs) {
+    if (!isSilentUpstreamRejection(result)) return null;
+    return Number(elapsedMs) >= SILENT_REJECTION_MIN_GENERATION_MS ? 'aborted' : 'throttle';
 }
 
 function appendPromptInstruction(promptText, instruction, maxChars = MAX_UPSTREAM_PROMPT_CHARS) {
@@ -3018,23 +3040,43 @@ const server = http.createServer(async (req, res) => {
             // a transient upstream hiccup, not a dead chat. Only a second empty
             // response justifies throwing the chat away.
             //
-            // A stream that produced no message id at all is excluded: that is the
-            // upstream refusing the turn, and re-sending it only deepens the throttle.
-            let silentRejection = isSilentUpstreamRejection(initialResult);
-            if (silentRejection) {
-                console.log(`${agentTag} upstream returned an empty stream with no message id in ${elapsed}ms — treating it as a throttled turn, not retrying it`);
+            // A stream with no message id is split by elapsed time: refused before
+            // any generation means a throttle, died after seconds of work means an
+            // aborted generation that is retryable like any other empty response.
+            const rejectionCause = classifySilentUpstreamRejection(initialResult, elapsed);
+            let silentRejection = rejectionCause === 'throttle';
+            if (rejectionCause) {
+                console.log(
+                    `${agentTag} empty stream with no message id in ${elapsed}ms — ${rejectionCause === 'throttle' ? 'refused before generating (throttle)' : 'generation aborted mid-flight (retryable)'}`,
+                );
             }
             // Retry payloads are the delta tail on a live chat and the whole transcript on
             // a recreated one, but both are sent together with the injected tool
             // definitions, so the budget is measured over the assembled prompt.
             let retryAttempt = 0;
+            let throttleWaits = 0;
             let keptSessionForRetry = false;
             while (!fullContent || fullContent.trim().length === 0) {
                 // Stop early if the client hung up or we've blown the request budget —
                 // no point burning more PoW solves + account quota for a dead socket.
-                if (silentRejection) break;
                 if (clientGone) { console.log(`${agentTag} client disconnected; abandoning empty-retry loop`); return; }
                 if (deadlineHit()) { console.log(`${agentTag} request deadline hit; stopping empty-retry loop`); break; }
+                // A throttled turn is served its cooldown here and then retried once in
+                // place, so a transient burst stays invisible to the client instead of
+                // surfacing as a 429 it has to handle. Given up only when the request
+                // budget cannot cover the wait.
+                if (silentRejection) {
+                    const cooldownMs = INFERRED_THROTTLE_COOLDOWN_MS;
+                    const affordable = Date.now() - requestStartedAt + cooldownMs < REQUEST_DEADLINE_MS;
+                    if (!affordable || throttleWaits >= 1) break;
+                    throttleWaits++;
+                    console.log(`${agentTag} throttle detected; waiting ${Math.round(cooldownMs / 1000)}s and retrying once in place (chat kept)`);
+                    await new Promise(r => setTimeout(r, cooldownMs));
+                    if (clientGone) { console.log(`${agentTag} client disconnected during throttle wait; abandoning`); return; }
+                    if (deadlineHit()) { console.log(`${agentTag} request deadline hit during throttle wait; stopping`); break; }
+                    // The cooldown has been served, so a second refusal is final.
+                    silentRejection = false;
+                }
                 const contextTooLong = isContextTooLongError(modelError);
                 if (modelError && !contextTooLong) break;
                 if (retryAttempt >= MAX_EMPTY_RETRIES) break;
@@ -3081,8 +3123,10 @@ const server = http.createServer(async (req, res) => {
                 }
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
+                const retryCallStart = Date.now();
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
                 const retryResult = await readDeepSeekResponse(retryResp.body);
+                const retryElapsed = Date.now() - retryCallStart;
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
                 modelError = retryState.modelError;
@@ -3092,11 +3136,16 @@ const server = http.createServer(async (req, res) => {
                 // A previous empty response may have carried finish_reason=length.
                 // Never leak it into a successful retry that supplied no reason.
                 finishReason = retryState.finishReason;
-                if (isSilentUpstreamRejection(retryResult)) {
-                    // Same signature as the first attempt: the account is refusing
-                    // turns, so a further retry would only add to the burst.
-                    silentRejection = true;
-                    break;
+                const retryRejection = classifySilentUpstreamRejection(retryResult, retryElapsed);
+                if (retryRejection) {
+                    console.log(
+                        `${agentTag} retry ${retryAttempt} also empty with no message id in ${retryElapsed}ms — ${retryRejection === 'throttle' ? 'still refused, cooldown did not clear it' : 'aborted again'}`,
+                    );
+                    // A refusal this soon after the cooldown was already served is final.
+                    // An aborted generation is not: it is an ordinary empty response and
+                    // stays inside the loop's own retry budget.
+                    silentRejection = retryRejection === 'throttle';
+                    if (silentRejection) break;
                 }
                 if (retryState.content && retryState.content.trim().length > 0) {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
@@ -3122,7 +3171,7 @@ const server = http.createServer(async (req, res) => {
                     res.end(JSON.stringify({
                         error: {
                             message: silentRejection
-                                ? `DeepSeek refused this turn with an empty response stream (no message id) — usually a short throttle or an aborted upstream generation. The chat was kept; retry in ~${retryAfterSec}s.`
+                                ? `DeepSeek refused this turn up front (empty stream, no message id, no time spent generating) — an account-level throttle that did not clear after a ${Math.round(INFERRED_THROTTLE_COOLDOWN_MS / 1000)}s wait. The chat was kept; retry in ~${retryAfterSec}s.`
                                 : `DeepSeek throttled this auth account ("${String(modelError?.content || 'too many requests').substring(0, 120)}"). The chat was kept — retry in ~${retryAfterSec}s. If it keeps happening, the account itself is rate-limited: add a second account (npm run auth:import, DEEPSEEK_AUTH_DIR=./accounts) or wait it out.`,
                             type: 'rate_limit_error',
                             agent: agentId,
@@ -3533,6 +3582,7 @@ module.exports = {
         assembledPromptLength,
         MIN_SHRINKABLE_PROMPT_CHARS,
         isSilentUpstreamRejection,
+        classifySilentUpstreamRejection,
         acquireAgentTurnLock,
         isContinuationRecoverySafe,
         isContextTooLongError,

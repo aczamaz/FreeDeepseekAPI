@@ -331,6 +331,37 @@ test('parseToolCall accepts the doubled-bar DSML Web variant from issue #19', ()
   assert.deepEqual(JSON.parse(call.arguments), { query: 'DeepSeek DSML' });
 });
 
+test('parseToolCall ignores non-JSON fences instead of logging bogus parse failures', () => {
+  // A reply that shows commands to the user and then really calls a tool. Every
+  // ```bash / ```yaml fence used to be handed to JSON.parse and reported as a
+  // failure, which looked like a broken tool parser but only meant "not JSON".
+  const logs = [];
+  const realLog = console.log;
+  console.log = (msg) => logs.push(String(msg));
+  try {
+    const call = serverInternals.parseToolCall([
+      'Сначала посмотрю структуру:',
+      '```bash',
+      'bash\ncd /tmp\nls',
+      '```',
+      '```yaml',
+      'yaml\ninput: x',
+      '```',
+      'Потом выполню:',
+      '```json',
+      '{"tool_call":{"name":"bash","arguments":{"cmd":"ls -la"}}}',
+      '```',
+    ].join('\n'));
+    assert.deepEqual(call, { name: 'bash', arguments: '{"cmd":"ls -la"}' });
+  } finally {
+    console.log = realLog;
+  }
+
+  const bogus = logs.filter((l) => l.includes('JSON.parse failed'));
+  assert.deepEqual(bogus, [], 'no bogus parse-failure lines for non-JSON fences');
+  assert.ok(logs.some((l) => l.includes('SUCCESS fenced')));
+});
+
 test('parseToolCall accepts zero-argument, CDATA, legacy, collapsed, and prefixed wrappers', () => {
   const zeroArg = serverInternals.parseToolCall(
     '<|DSML|tool_calls><|DSML|invoke name="ping"></|DSML|invoke></|DSML|tool_calls>'
@@ -1198,6 +1229,28 @@ test('an empty stream with no message id is classified as a throttled turn', () 
   assert.equal(serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: 'thinking', messageId: 7, modelError: null }), false);
   // An explicit error event is already classified, so it must not be double-counted.
   assert.equal(serverInternals.isSilentUpstreamRejection({ content: '', reasoningContent: '', messageId: null, modelError: { type: 'error', content: 'boom' } }), false);
+});
+
+test('an empty stream with no message id splits into a throttle and an aborted generation by elapsed time', () => {
+  // The shape alone cannot tell them apart, and the two need opposite handling:
+  // a refusal must not be re-sent immediately, an aborted generation must be
+  // retried instead of surfacing a 429 the client has to deal with. Elapsed time
+  // is the only signal that says whether DeepSeek ever started generating.
+  const silent = { content: '', reasoningContent: '', messageId: null, modelError: null };
+
+  // Refused before any generation time — a real refusal lands in about a second.
+  assert.equal(serverInternals.classifySilentUpstreamRejection(silent, 400), 'throttle');
+  assert.equal(serverInternals.classifySilentUpstreamRejection(silent, 1164), 'throttle');
+  assert.equal(serverInternals.classifySilentUpstreamRejection(silent, 2499), 'throttle');
+
+  // Died after seconds of work — retryable, same as any other empty response.
+  assert.equal(serverInternals.classifySilentUpstreamRejection(silent, 2500), 'aborted');
+  assert.equal(serverInternals.classifySilentUpstreamRejection(silent, 20219), 'aborted');
+
+  // Not a silent rejection at all: a real turn carries a message id.
+  assert.equal(serverInternals.classifySilentUpstreamRejection({ ...silent, messageId: 7 }, 100), null);
+  assert.equal(serverInternals.classifySilentUpstreamRejection({ ...silent, content: 'hi' }, 100), null);
+  assert.equal(serverInternals.classifySilentUpstreamRejection(null, 100), null);
 });
 
 test('one turn at a time per conversation, independent across conversations', async () => {
