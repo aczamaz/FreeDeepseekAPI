@@ -458,6 +458,39 @@ test('parseToolCall accepts the bare DSML `calls` wrapper and JSON bodies', () =
   assert.equal(serverInternals.parseToolCall('<｜｜DSML｜｜ calls>{"tool_call":{"name":"x","arguments":{}}} trailing</｜｜DSML｜｜ calls>'), null);
 });
 
+test('parseToolCall salvages a mangled DSML invoke', () => {
+  // The model sometimes leaks the DSML sentinel without angle brackets, so the
+  // parameters run together on one line and the closers are mangled. The strict
+  // parser rejects this; salvage recovers the first invoke's readable args.
+  const mangled = [
+    '<｜｜DSML｜｜ calls>',
+    '<｜｜DSML｜｜ invoke name="read">',
+    '<｜｜DSML｜｜ parameter name="filePath" string="true">/tmp/a｜｜DSML｜｜ parameter="offset" string="false">10｜｜DSML｜｜ parameter="limit" string="false">20｜｜DSML｜｜ parameter>',
+    '</｜｜DSML｜｜ invoke>',
+    '</｜｜DSML｜｜ calls>',
+  ].join('\n');
+  const call = serverInternals.parseToolCall(mangled);
+  assert.equal(call.name, 'read');
+  assert.deepEqual(JSON.parse(call.arguments), { filePath: '/tmp/a', offset: 10, limit: 20 });
+
+  // Pipes inside a string value survive: the next parameter is the boundary,
+  // not the first raw `|`.
+  const piped = [
+    '<｜｜DSML｜｜ calls>',
+    '<｜｜DSML｜｜ invoke name="bash">',
+    '<｜｜DSML｜｜ parameter name="command" string="true">grep -n a|b|c file.txt | head -5｜｜DSML｜｜ parameter="workdir" string="true">/tmp｜｜DSML｜｜ parameter>',
+    '</｜｜DSML｜｜ invoke>',
+    '</｜｜DSML｜｜ calls>',
+  ].join('\n');
+  const bash = serverInternals.parseToolCall(piped);
+  assert.equal(bash.name, 'bash');
+  assert.deepEqual(JSON.parse(bash.arguments), { command: 'grep -n a|b|c file.txt | head -5', workdir: '/tmp' });
+
+  // Salvage still needs the wrapper: a bare mangled invoke never runs.
+  const bare = '<｜｜DSML｜｜ invoke name="execute_code">｜｜DSML｜｜ parameter name="code" string="true">danger()｜｜DSML｜｜ parameter>';
+  assert.equal(serverInternals.parseToolCall(bare), null);
+});
+
 test('parseToolCall repairs envelopes the stream cut short', () => {
   // One missing tail brace: the common case when the SSE reader drops the
   // final `data:` line, and when the model stops mid-object.
@@ -1340,7 +1373,7 @@ test('remote reset preserves local history and sticky account while returning fa
   assert.equal(session.history.length, 1);
 });
 
-test('short sticky cooldown waits it out and preserves the remote session', async (t) => {
+test('a cooling sticky account rotates to a free account and recreates the remote chat', async (t) => {
   const originalAccounts = serverInternals.accounts.splice(0);
   t.after(() => {
     serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
@@ -1370,15 +1403,17 @@ test('short sticky cooldown waits it out and preserves the remote session', asyn
   session.history.push({ user: 'old task', assistant: 'old answer' });
 
   const selected = await serverInternals.selectAccountForSession(session);
-  assert.equal(selected.id, 'cooling');
-  assert.equal(session.accountId, 'cooling');
-  assert.equal(session.id, 'sticky-session');
-  assert.equal(session.parentMessageId, 'sticky-parent');
-  assert.equal(session.messageCount, 7);
+  assert.equal(selected.id, 'ready');
+  assert.equal(session.accountId, 'ready');
+  // The remote chat belonged to the cooling account, so it is dropped and rebuilt
+  // from local recovery history; the transcript itself is preserved.
+  assert.equal(session.id, null);
+  assert.equal(session.parentMessageId, null);
+  assert.equal(session.messageCount, 0);
   assert.equal(session.history.length, 1);
 });
 
-test('long sticky cooldown returns 429 without resetting the session', async (t) => {
+test('429 only when every account is cooling, and the session is left untouched', async (t) => {
   const originalAccounts = serverInternals.accounts.splice(0);
   t.after(() => {
     serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
@@ -1393,9 +1428,9 @@ test('long sticky cooldown returns 429 without resetting the session', async (t)
       nextSlotAt: 0,
     },
     {
-      id: 'ready',
+      id: 'cooling-other',
       config: { token: 'two', cookie: 'two' },
-      cooldownUntil: 0,
+      cooldownUntil: Date.now() + serverInternals.STICKY_WAIT_MS + 60_000,
       headers: {},
       nextSlotAt: 0,
     },
