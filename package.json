@@ -31,5 +31,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/ForgetMeAI/FreeDeepseekAPI.git"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.7"
   }
 }
