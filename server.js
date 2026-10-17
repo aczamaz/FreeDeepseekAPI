@@ -6,8 +6,9 @@
  * parses LLM text responses for TOOL_CALL patterns, returns OpenAI tool_calls format.
  * 
  * Per-agent sessions: each unique `user` field gets its own DeepSeek web session.
- * Auto-reset: sessions reset when message chain reaches DEEPSEEK_MAX_MESSAGE_DEPTH (default 100)
- * or age exceeds DEEPSEEK_SESSION_TTL_MS (default 6 hours).
+ * Auto-reset: sessions reset on a real context-overflow error, when the message
+ * chain reaches DEEPSEEK_MAX_MESSAGE_DEPTH (default 0 = no cap), or when age
+ * exceeds DEEPSEEK_SESSION_TTL_MS (default 6 hours).
  * Listens on 127.0.0.1:9655 by default (HOST is configurable)
  */
 
@@ -20,6 +21,85 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { solvePOW } = require('./lib/pow');
 const authConfig = require('./lib/auth_config');
+
+// === File logging ===
+// Every console.* call is teed to a rotating log file, so a long proxy run can be
+// analyzed after the fact (session resets, throttles, delta prompts, recovery).
+// Enabled by default when the server runs as the entry point; a bare `require`
+// (unit tests) does not create a file. Override the path with DEEPSEEK_LOG_FILE
+// or turn it off with DEEPSEEK_LOG_TO_FILE=0.
+const LOG_FILE_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_LOG_TO_FILE ?? '1'));
+const LOG_FILE_PATH = process.env.DEEPSEEK_LOG_FILE || path.join(__dirname, 'logs', 'proxy.log');
+const configuredLogMax = Number(process.env.DEEPSEEK_LOG_MAX_BYTES);
+const LOG_FILE_MAX_BYTES = Number.isFinite(configuredLogMax) && configuredLogMax > 0
+    ? Math.floor(configuredLogMax)
+    : 20 * 1024 * 1024;
+let fileLoggingInstalled = false;
+
+// Keep one previous file (proxy.log.1) so a rotation never loses the window that
+// immediately precedes the interesting event.
+// Synchronous appends: log volume is per-turn, not per-token, so the cost is
+// negligible and it makes size tracking, rotation and crash-durability exact
+// (an async WriteStream may not have created the file yet when rotating).
+function createFileLogger(filePath, maxBytes) {
+    let bytes = null;
+    const size = () => {
+        if (bytes !== null) return bytes;
+        try { bytes = fs.statSync(filePath).size; } catch (e) { bytes = 0; }
+        return bytes;
+    };
+    const rotate = () => {
+        try {
+            fs.renameSync(filePath, `${filePath}.1`);
+        } catch (e) { /* first run: nothing to rotate */ }
+        bytes = 0;
+    };
+    const write = (line) => {
+        try {
+            if (maxBytes > 0 && size() >= maxBytes) rotate();
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.appendFileSync(filePath, line, { mode: 0o600 });
+            bytes = size() + Buffer.byteLength(line);
+        } catch (e) { /* logging must never take the server down */ }
+    };
+    const close = () => { bytes = null; };
+    return { write, close };
+}
+
+const fileLogger = createFileLogger(LOG_FILE_PATH, LOG_FILE_MAX_BYTES);
+function writeLogFile(line) { fileLogger.write(line); }
+
+let logLineHook = null;
+// Test seam: capture the exact stamped line the tee would write to disk without
+// touching the real log file.
+function setLogLineHook(fn) { logLineHook = typeof fn === 'function' ? fn : null; }
+
+function stampLogText(text) {
+    return String(text)
+        .split('\n')
+        .map(line => (line.length ? `[${new Date().toISOString()}] ${line}` : line))
+        .join('\n');
+}
+
+function installFileLogging() {
+    if (fileLoggingInstalled || !LOG_FILE_ENABLED) return;
+    fileLoggingInstalled = true;
+    const util = require('util');
+    const emit = (text) => {
+        const payload = `${stampLogText(text)}\n`;
+        writeLogFile(payload);
+        if (typeof logLineHook === 'function') { try { logLineHook(payload); } catch (e) {} }
+    };
+    for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+        if (typeof console[level] !== 'function') continue;
+        const original = console[level].bind(console);
+        console[level] = (...args) => {
+            original(...args);
+            try { emit(util.format(...args)); } catch (e) {}
+        };
+    }
+    writeLogFile(stampLogText(`[DS-API] file logging started -> ${LOG_FILE_PATH}`) + '\n');
+}
 
 // Per-DeepSeek-request network timeout. Plain fetch() has NO default timeout, so a
 // stalled upstream would hang the inbound request (and pin the account) forever.
@@ -149,7 +229,14 @@ const announcedConversations = new Map();
 // what it needs through tools, and a big buffer bloats every fresh prompt.
 const MAX_HISTORY_LENGTH = Number(process.env.DEEPSEEK_MAX_HISTORY_LENGTH || 3);
 const MAX_HISTORY_CHARS = Number(process.env.DEEPSEEK_MAX_HISTORY_CHARS || 2000);
-const MAX_MESSAGE_DEPTH = Number(process.env.DEEPSEEK_MAX_MESSAGE_DEPTH || 100);  // auto-reset after this many messages
+// Depth cap for the remote chat. 0 disables it: the session is then reset only
+// on a real context-overflow error, a TTL expiry, account rotation or a chat-id
+// error — not on a timer. The old default of 100 reset a chat while it was still
+// perfectly healthy and then re-seeded it from a truncated transcript, which is
+// what made long sessions suddenly lose the plot. Set DEEPSEEK_MAX_MESSAGE_DEPTH
+// to a positive number to bring back the proactive reset.
+const configuredDepth = Number(process.env.DEEPSEEK_MAX_MESSAGE_DEPTH);
+const MAX_MESSAGE_DEPTH = Number.isFinite(configuredDepth) ? Math.max(0, Math.floor(configuredDepth)) : 0;
 const SESSION_TTL_MS = Number(process.env.DEEPSEEK_SESSION_TTL_MS || 6 * 60 * 60 * 1000);  // 6 hours
 
 // === DeepSeek Web API Config — loaded from external config file ===
@@ -219,6 +306,56 @@ const configuredFreshChars = Number(process.env.DEEPSEEK_FRESH_SESSION_PROMPT_CH
 const FRESH_SESSION_PROMPT_CHARS = Number.isFinite(configuredFreshChars)
     ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredFreshChars))
     : 12000;
+
+// === Context-reduction experiments ===
+// The proxy already sends only the new delta tail on a live remote chat, but it
+// re-injected the whole tool definition block (descriptions + JSON schemas) on
+// every turn. Those definitions went out on the first message and stay in the
+// remote chat's context, so on a delta turn only the names and the output
+// contract need repeating. Set DEEPSEEK_COMPACT_TOOL_REMINDER=0 to go back to
+// the full block on every turn.
+const COMPACT_TOOL_REMINDER = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_COMPACT_TOOL_REMINDER ?? '1'));
+// A live chat remembers the transcript, but a long one eventually compacts it
+// away. A small state block (the latest todo list) prepended to a delta keeps
+// the plan anchored. It is emitted only when the transcript actually carries a
+// todo list, so it costs nothing for clients that do not use one.
+const STATE_BLOCK_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_STATE_BLOCK ?? '1'));
+const TODO_MAX_ITEMS = 20;
+const STATE_BLOCK_MAX_SUMMARY_CHARS = 800;
+// When a remote chat is recreated (TTL/depth rollover, account rotation, chat-id
+// error) the recovery buffer held only the last few exchanges, so a long session
+// restarted almost blind. A rolling digest of every user task asked in the
+// session is kept beside it and replayed on reset.
+const ROLLING_SUMMARY_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_ROLLING_SUMMARY ?? '1'));
+const configuredSummaryChars = Number(process.env.DEEPSEEK_ROLLING_SUMMARY_CHARS);
+const ROLLING_SUMMARY_CHARS = Number.isFinite(configuredSummaryChars) && configuredSummaryChars > 0
+    ? Math.max(500, Math.floor(configuredSummaryChars))
+    : 4000;
+const ROLLING_SUMMARY_MAX_TASKS = Number(process.env.DEEPSEEK_ROLLING_SUMMARY_TASKS || 40);
+// A recreated chat is not a brand-new one: the caller already has a transcript to
+// seed it with, so the tiny first-message cap (FRESH_SESSION_PROMPT_CHARS) would
+// throw most of it away — exactly the "reset made it dumb" symptom. Recovery gets
+// its own, much larger budget. DEEPSEEK_ROLLOVER_PROMPT_CHARS=0 falls back to the
+// fresh cap.
+const configuredRolloverChars = Number(process.env.DEEPSEEK_ROLLOVER_PROMPT_CHARS);
+const ROLLOVER_PROMPT_CHARS = Number.isFinite(configuredRolloverChars) && configuredRolloverChars > 0
+    ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredRolloverChars))
+    : 60000;
+// Two-step priming: a very large first message to a brand-new chat often comes
+// back as an empty stream, which is why the fresh cap exists. Warming the chat
+// with a tiny exchange first lets the large recovery prompt be sent as an
+// ordinary follow-up. Set DEEPSEEK_PRIME_LARGE_PROMPT=0 to disable.
+const PRIME_LARGE_FIRST_MESSAGE = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_PRIME_LARGE_PROMPT ?? '1'));
+const PRIME_MESSAGE = 'We are resuming a long session. Reply with the single word: ready.';
+// On a proxy-driven reset, ask the model for a real handover summary of the work
+// so far instead of replaying the crude list of user requests. Set
+// DEEPSEEK_LLM_SUMMARY=0 to keep the digest.
+const LLM_SUMMARY_ENABLED = !/^(0|false|no|off)$/i.test(String(process.env.DEEPSEEK_LLM_SUMMARY ?? '1'));
+const configuredSummaryInput = Number(process.env.DEEPSEEK_SUMMARY_INPUT_CHARS);
+const SUMMARY_INPUT_CHARS = Number.isFinite(configuredSummaryInput) && configuredSummaryInput > 0
+    ? Math.floor(configuredSummaryInput)
+    : 24000;
+
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -466,6 +603,9 @@ function createSession() {
         messageCount: 0,
         accountId: null,
         history: [],
+        summary: '',
+        summaryLines: [],
+        handover: '',
         lastActivityAt: Date.now(),
     };
 }
@@ -485,13 +625,27 @@ function resetRemoteSession(session) {
     return failed;
 }
 
-function prepareSessionForPrompt(session, now = Date.now()) {
+// Non-mutating check: what would make this session roll over right now. Kept
+// separate so the caller can generate a handover summary before the remote chat
+// (and its context) is dropped.
+function sessionRolloverReason(session, now = Date.now(), maxDepth = MAX_MESSAGE_DEPTH) {
     if (!session || !session.id) return null;
-    let reason = null;
-    if (session.messageCount >= MAX_MESSAGE_DEPTH) reason = 'max_message_depth';
-    else if (session.createdAt && now - session.createdAt > SESSION_TTL_MS) reason = 'session_ttl';
+    if (maxDepth > 0 && session.messageCount >= maxDepth) return 'max_message_depth';
+    if (session.createdAt && now - session.createdAt > SESSION_TTL_MS) return 'session_ttl';
+    return null;
+}
+
+function prepareSessionForPrompt(session, now = Date.now(), maxDepth = MAX_MESSAGE_DEPTH) {
+    const reason = sessionRolloverReason(session, now, maxDepth);
     if (!reason) return null;
     return { reason, ...resetRemoteSession(session) };
+}
+
+// A recreated chat that already has a conversation behind it may seed far more
+// context than a genuinely first-ever turn, which has to stay inside the small
+// fresh cap (a large first message tends to come back as an empty stream).
+function selectSeedBudget(hasHistory) {
+    return hasHistory ? ROLLOVER_PROMPT_CHARS : FRESH_SESSION_PROMPT_CHARS;
 }
 
 function getOrCreateAgentSession(agentId) {
@@ -572,6 +726,9 @@ function serializeSession(session) {
         messageCount: Number(session.messageCount) || 0,
         accountId: session.accountId || null,
         history: Array.isArray(session.history) ? session.history : [],
+        summary: typeof session.summary === 'string' ? session.summary : '',
+        summaryLines: Array.isArray(session.summaryLines) ? session.summaryLines : [],
+        handover: typeof session.handover === 'string' ? session.handover : '',
         lastActivityAt: session.lastActivityAt || Date.now(),
     };
 }
@@ -631,6 +788,9 @@ function loadPersistedSessions(file = SESSIONS_FILE) {
         fresh.messageCount = Number(saved.messageCount) || 0;
         fresh.accountId = saved.accountId ?? null;
         fresh.history = Array.isArray(saved.history) ? saved.history : [];
+        fresh.summary = typeof saved.summary === 'string' ? saved.summary : '';
+        fresh.summaryLines = Array.isArray(saved.summaryLines) ? saved.summaryLines : [];
+        fresh.handover = typeof saved.handover === 'string' ? saved.handover : '';
         fresh.lastActivityAt = Number(saved.lastActivityAt) || now;
         sessions.set(String(agentId), fresh);
         restored++;
@@ -955,6 +1115,44 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
+// Minimal upstream reader for internal calls (priming, summarization) that only
+// need the reply text and the message id.
+async function readUpstreamText(readable) {
+    const acc = createDeepSeekStreamAccumulator();
+    await readDeepSeekSseLines(readable, (line) => {
+        if (line && line.startsWith('data: ')) acc.handleLine(line);
+    });
+    return acc.result();
+}
+
+const SUMMARY_INSTRUCTION = [
+    'You are compacting a coding/agent session so a fresh chat can continue it.',
+    'Write a dense handover note covering: the overall goal, what has been done,',
+    'key files or paths, decisions made, the current state, and what still remains.',
+    'Use short bullets. No pleasantries. Never invent facts that are not in the',
+    'transcript below.',
+].join(' ');
+
+// Summarize a session on an isolated throwaway chat so generating the handover
+// can never desync the user's live thread. Returns '' if the upstream call fails
+// or returns nothing, and the caller keeps the rolling digest instead.
+async function summarizeConversation(agentId, model, conversation) {
+    const transcript = String(conversation || '').trim();
+    if (transcript.length < 200) return '';
+    const clipped = transcript.length > SUMMARY_INPUT_CHARS
+        ? transcript.slice(transcript.length - SUMMARY_INPUT_CHARS)
+        : transcript;
+    const prompt = `${SUMMARY_INSTRUCTION}\n\n--- SESSION TRANSCRIPT ---\n${clipped}\n--- END TRANSCRIPT ---\n\nHandover note:`;
+    const summaryAgentId = `${agentId}#summary`;
+    try {
+        const call = await askDeepSeekStream(prompt, summaryAgentId, model);
+        const result = await readUpstreamText(call.resp.body);
+        return sanitizeContent(result.content || '').trim();
+    } finally {
+        sessions.delete(summaryAgentId);
+        scheduleSessionPersist();
+    }
+}
 
 async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
     const modelCfg = resolveModelConfig(model);
@@ -999,6 +1197,12 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     }
     const answer = await solvePOW(challenge, account.config.wasmUrl);
 
+    const powB64 = Buffer.from(JSON.stringify({
+        algorithm: challenge.algorithm, challenge: challenge.challenge,
+        salt: challenge.salt, answer: answer,
+        signature: challenge.signature, target_path: '/api/v0/chat/completion'
+    })).toString('base64');
+
     if (!session.id) {
         await paceUpstreamCall(account);
         const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
@@ -1015,15 +1219,45 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         session.createdAt = Date.now();
         session.messageCount = 0;
         console.log(`${agentTag} Created new session: ${session.id}`);
+
+        // Two-step priming: a large first message to a brand-new chat tends to
+        // come back as an empty stream (that is why FRESH_SESSION_PROMPT_CHARS is
+        // small). Warm the chat with a tiny exchange, capture its reply id, then
+        // let the large recovery prompt go out as an ordinary follow-up.
+        if (PRIME_LARGE_FIRST_MESSAGE && effectivePrompt.length > FRESH_SESSION_PROMPT_CHARS) {
+            try {
+                await paceUpstreamCall(account);
+                const primeResp = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
+                    method: 'POST',
+                    headers: { ...dsHeaders, 'X-DS-PoW-Response': powB64 },
+                    body: JSON.stringify({
+                        chat_session_id: session.id,
+                        parent_message_id: null,
+                        model_type: modelCfg.model_type,
+                        prompt: PRIME_MESSAGE, ref_file_ids: [],
+                        thinking_enabled: false, search_enabled: false,
+                        action: null, preempt: false,
+                    }),
+                });
+                if (primeResp.ok) {
+                    const primeResult = await readUpstreamText(primeResp.body);
+                    if (primeResult.messageId) {
+                        session.parentMessageId = primeResult.messageId;
+                        session.messageCount++;
+                        console.log(`${agentTag} Primed new chat before the ${effectivePrompt.length}-char recovery prompt.`);
+                    }
+                } else {
+                    await primeResp.text().catch(() => {});
+                    console.log(`${agentTag} Priming returned HTTP ${primeResp.status}; sending the recovery prompt as the first message.`);
+                }
+            } catch (e) {
+                console.log(`${agentTag} Priming failed (${e.message}); sending the recovery prompt as the first message.`);
+            }
+        }
     } else {
         console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
     }
 
-    const powB64 = Buffer.from(JSON.stringify({
-        algorithm: challenge.algorithm, challenge: challenge.challenge,
-        salt: challenge.salt, answer: answer,
-        signature: challenge.signature, target_path: '/api/v0/chat/completion'
-    })).toString('base64');
     await paceUpstreamCall(account);
     const resp = await dsFetch('https://chat.deepseek.com/api/v0/chat/completion', {
         method: 'POST',
@@ -1145,8 +1379,25 @@ function compactToolSchema(value) {
     return compact;
 }
 
-function formatToolDefinitions(tools) {
+function formatToolDefinitions(tools, { compact = false } = {}) {
     if (!tools || tools.length === 0) return '';
+    // On a live chat the full schemas are already in the remote context, so a
+    // delta turn repeats only the names and the output contract. Dropping the
+    // per-turn descriptions + JSON schemas is the single largest saving on the
+    // hot path of a long agent session.
+    if (compact) {
+        const names = tools
+            .filter(tool => tool && tool.type === 'function' && tool.function)
+            .map(tool => tool.function.name);
+        let reminder = '\n\n--- TOOL REQUEST REMINDER ---\n';
+        reminder += 'The full tool definitions from the start of this chat still apply. Use the same output format:\n';
+        reminder += '{"tool_call":{"name":"<function_name>","arguments":{...}}}\n';
+        reminder += 'Legacy format: TOOL_CALL: <function_name>\narguments: <JSON arguments>\n';
+        reminder += `Available functions: ${names.join(', ')}\n`;
+        reminder += 'Never simulate tool output — emit the request and wait for the result.\n';
+        reminder += '--- END TOOL REQUEST REMINDER ---\n';
+        return reminder;
+    }
     const rawSchemaChars = tools.reduce((total, tool) => {
         try { return total + JSON.stringify(tool?.function?.parameters || {}).length; }
         catch (e) { return total; }
@@ -2341,6 +2592,7 @@ function storeHistory(agentId, prompt, content, toolCall, toolCallPreamble = '')
         const removed = session.history.shift();
         historyChars -= removed.user.length + removed.assistant.length;
     }
+    updateRollingSummary(session, prompt);
 }
 
 // Extract MEDIA: paths from tool results that contain screenshot paths
@@ -2404,11 +2656,18 @@ function hasExplicitConversationHistory(messages) {
     return turns.length > 1 || turns.some(msg => msg.role === 'assistant' || msg.role === 'tool');
 }
 
-function buildRecoveryHistoryPrefix(history) {
-    if (!Array.isArray(history) || history.length === 0) return '';
+function buildRecoveryHistoryPrefix(history, summary = '') {
+    const hasHistory = Array.isArray(history) && history.length > 0;
+    const summaryText = String(summary || '').trim();
+    if (!hasHistory && !summaryText) return '';
     let prefix = '[Previous conversation]\n';
-    for (const exchange of history) {
-        prefix += `User: ${String(exchange?.user || '')}\nAssistant: ${String(exchange?.assistant || '')}\n\n`;
+    if (summaryText) {
+        prefix += `Session progress (tasks asked earlier in this session, oldest first):\n${summaryText}\n\n`;
+    }
+    if (hasHistory) {
+        for (const exchange of history) {
+            prefix += `User: ${String(exchange?.user || '')}\nAssistant: ${String(exchange?.assistant || '')}\n\n`;
+        }
     }
     return prefix + '[Continue from here]\n\n';
 }
@@ -2762,14 +3021,14 @@ function selectDeltaMessages(messages, session) {
     return null;
 }
 
-function formatMessages(messages, tools) {
+function formatMessages(messages, tools, options = {}) {
     let systemPrompt = '';
     for (const msg of messages) {
         if (msg.role === 'system' && msg.content) {
             systemPrompt += normalizeMessageContent(msg.content) + '\n';
         }
     }
-    systemPrompt += formatToolDefinitions(tools);
+    systemPrompt += formatToolDefinitions(tools, options);
 
     // Build full conversation history for DeepSeek's context
     let conversation = '';
@@ -2797,6 +3056,140 @@ function formatMessages(messages, tools) {
     }
     // The last user message + full conversation context
     return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
+}
+
+// === Session state block + rolling summary ===
+// Both features read the client transcript, which arrives complete on every
+// turn, so nothing has to be stored upstream to reconstruct them.
+const TODO_CHECKBOX_RE = /^\s*[-*]\s*\[([ xX~>])\]\s+(\S.*)$/;
+
+function stringifyTodoValue(value) {
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+        return value.content || value.text || value.task || value.title || value.description || value.subject || '';
+    }
+    return '';
+}
+
+// Normalise one parsed todo entry (opencode's todowrite shape, or a loose
+// {content, status} pair) into a checkbox line. Returns null when the object
+// does not look like a todo at all, so unrelated JSON is never mistaken for one.
+function formatTodoEntry(entry) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const text = String(stringifyTodoValue(entry)).replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    const status = String(entry.status || entry.state || '').toLowerCase();
+    const done = status === 'completed' || status === 'complete' || status === 'done' || status === 'x'
+        || entry.done === true || entry.completed === true;
+    const active = status === 'in_progress' || status === 'active' || status === 'doing' || status === 'running';
+    const box = done ? 'x' : (active ? '>' : ' ');
+    return `- [${box}] ${text}`;
+}
+
+// Parse a JSON string that is either a todo array or an object wrapping one under
+// `todos`. Returns checkbox lines, or null when it is not a todo container.
+function parseTodoContainer(text) {
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    } catch (e) {
+        return null;
+    }
+    const list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.todos) ? parsed.todos : null);
+    if (!list || list.length === 0) return null;
+    const formatted = list.map(formatTodoEntry).filter(Boolean);
+    return formatted.length > 0 ? formatted : null;
+}
+
+function extractTodosFromMessages(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (!msg || typeof msg.content !== 'string') continue;
+        if (msg.role !== 'tool' && msg.role !== 'assistant') continue;
+        const text = msg.content.trim();
+        if (!text) continue;
+        const direct = parseTodoContainer(text);
+        if (direct) return direct.slice(0, TODO_MAX_ITEMS);
+        for (const candidate of extractBalancedJsonObjects(text, 8)) {
+            const parsed = parseTodoContainer(candidate);
+            if (parsed) return parsed.slice(0, TODO_MAX_ITEMS);
+        }
+    }
+    return [];
+}
+
+// Prefer a structured todo list; fall back to markdown checkboxes in the newest
+// message that carries any. Always from the tail so an old completed list cannot
+// shadow the current one.
+function extractTodoLines(messages, limit = TODO_MAX_ITEMS) {
+    const structured = extractTodosFromMessages(messages);
+    if (structured.length > 0) return structured.slice(0, limit);
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (!msg || typeof msg.content !== 'string') continue;
+        const lines = [];
+        for (const raw of msg.content.split('\n')) {
+            const m = TODO_CHECKBOX_RE.exec(raw);
+            if (m) lines.push(`- [${/[xX]/.test(m[1]) ? 'x' : (/[~>]/.test(m[1]) ? '>' : ' ')}] ${m[2].trim()}`);
+        }
+        if (lines.length > 0) return lines.slice(0, limit);
+    }
+    return [];
+}
+
+// The session's accumulated "what happened" text: the LLM handover summary when
+// we have one, plus the rolling user-task digest. Kept in separate fields so the
+// digest (updated every turn) never overwrites the handover summary.
+function sessionProgressText(session) {
+    const handover = session && typeof session.handover === 'string' ? session.handover.trim() : '';
+    const digest = session && typeof session.summary === 'string' ? session.summary.trim() : '';
+    return [handover, digest].filter(Boolean).join('\n\n');
+}
+
+// A compact anchor prepended to a delta: the plan (todos) plus the tail of the
+// rolling progress digest. Returns '' when the transcript has neither, so
+// clients without todos pay nothing for the feature.
+function buildSessionStateBlock(messages, session) {
+    if (!STATE_BLOCK_ENABLED) return '';
+    const todos = extractTodoLines(messages || []);
+    const summary = sessionProgressText(session);
+    if (todos.length === 0 && !summary) return '';
+    let block = '[SESSION STATE]\nEarlier turns, full instructions and tool schemas are already above in this chat.\n';
+    if (summary) {
+        const tail = summary.length > STATE_BLOCK_MAX_SUMMARY_CHARS
+            ? '...' + summary.slice(summary.length - STATE_BLOCK_MAX_SUMMARY_CHARS)
+            : summary;
+        block += `Progress so far:\n${tail}\n`;
+    }
+    if (todos.length > 0) block += `Todo:\n${todos.join('\n')}\n`;
+    block += '[END SESSION STATE]';
+    return block;
+}
+
+// The last "User: ..." task in a serialized conversation, collapsed to one line.
+function extractTaskLine(conversation, maxChars = 200) {
+    const segment = extractLastUserTurn(conversation).replace(/^User:\s*/, '').replace(/\s+/g, ' ').trim();
+    if (!segment) return '';
+    return segment.length > maxChars ? segment.slice(0, maxChars - 3) + '...' : segment;
+}
+
+// Accumulate a bounded digest of the tasks asked in this session. It is replayed
+// as recovery history when the remote chat is recreated, so a reset no longer
+// drops everything before the last few exchanges.
+function updateRollingSummary(session, conversation) {
+    if (!ROLLING_SUMMARY_ENABLED || !session) return;
+    const task = extractTaskLine(conversation);
+    if (!task) return;
+    if (!Array.isArray(session.summaryLines)) session.summaryLines = [];
+    if (session.summaryLines[session.summaryLines.length - 1] === task) return;
+    session.summaryLines.push(task);
+    while (session.summaryLines.length > ROLLING_SUMMARY_MAX_TASKS) session.summaryLines.shift();
+    let text = session.summaryLines.join('\n');
+    while (text.length > ROLLING_SUMMARY_CHARS && session.summaryLines.length > 1) {
+        session.summaryLines.shift();
+        text = session.summaryLines.join('\n');
+    }
+    session.summary = text;
 }
 
 // === HTTP Server ===
@@ -3043,6 +3436,26 @@ const server = http.createServer(async (req, res) => {
             // waited, so everything below reads it only after the lock is held.
             session.lastActivityAt = Date.now();
 
+            // Before a proxy-driven reset drops the remote context, take the chance
+            // to distill the work into a real handover summary. It is generated on an
+            // isolated chat, so it cannot desync this conversation; on any failure the
+            // rolling digest is kept instead.
+            const rolloverReason = sessionRolloverReason(session);
+            if (rolloverReason && LLM_SUMMARY_ENABLED && messages.length > 1) {
+                const transcript = formatMessages(messages, []).prompt;
+                try {
+                    const summary = await summarizeConversation(agentId, requestedModel, transcript);
+                    if (summary) {
+                        session.handover = summary;
+                        console.log(`${agentTag} Handover summary generated for ${rolloverReason} reset (${summary.length} chars).`);
+                    } else {
+                        console.log(`${agentTag} Handover summary came back empty; keeping the task digest.`);
+                    }
+                } catch (e) {
+                    console.log(`${agentTag} Handover summary failed (${e.message}); keeping the task digest.`);
+                }
+            }
+
             // Roll over TTL/depth-limited sessions before deciding whether to
             // inject local recovery history into the newly built prompt.
             const promptRollover = prepareSessionForPrompt(session);
@@ -3054,10 +3467,24 @@ const server = http.createServer(async (req, res) => {
             // otherwise fall back to the whole transcript. The recovery path keeps
             // using the full transcript so a recreated chat never loses context.
             const deltaMessages = selectDeltaMessages(messages, session);
-            const { prompt, systemPrompt } = formatMessages(deltaMessages || messages, tools);
-            const recoveryPromptSource = deltaMessages ? formatMessages(messages, tools).prompt : prompt;
+            const useDelta = Boolean(deltaMessages);
+            const { prompt, systemPrompt } = formatMessages(deltaMessages || messages, tools, {
+                compact: COMPACT_TOOL_REMINDER && useDelta,
+            });
+            // A recreated chat has no memory of the schemas, so every recovery path
+            // must fall back to the full tool definitions, never the compact reminder.
+            const fullFormat = deltaMessages ? formatMessages(messages, tools) : null;
+            const recoveryPromptSource = fullFormat ? fullFormat.prompt : prompt;
+            const recoverySystemPrompt = fullFormat ? fullFormat.systemPrompt : systemPrompt;
             if (deltaMessages) {
-                console.log(`${agentTag} Delta prompt: ${deltaMessages.length} new message(s) instead of ${messages.length} (remote session ${session.id}).`);
+                console.log(`${agentTag} Delta prompt: ${deltaMessages.length} new message(s) instead of ${messages.length} (remote session ${session.id})${COMPACT_TOOL_REMINDER ? ', compact tool reminder' : ''}.`);
+            }
+
+            // The state block (plan + progress) rides in front of a delta only.
+            let livePrompt = prompt;
+            if (useDelta) {
+                const stateBlock = buildSessionStateBlock(messages, session);
+                if (stateBlock) livePrompt = `${stateBlock}\n\n${prompt}`;
             }
 
             // Keep a recovery prompt available even while the upstream session
@@ -3065,17 +3492,24 @@ const server = http.createServer(async (req, res) => {
             // state disappears and the replacement must receive local history.
             const recoveryHistoryPrefix = hasExplicitConversationHistory(messages)
                 ? ''
-                : buildRecoveryHistoryPrefix(session.history);
+                : buildRecoveryHistoryPrefix(session.history, sessionProgressText(session));
             const historyPrefix = !session.id ? recoveryHistoryPrefix : '';
 
-            const livePromptBudget = session.id ? MAX_UPSTREAM_PROMPT_CHARS : FRESH_SESSION_PROMPT_CHARS;
-            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, prompt, livePromptBudget);
-            const freshPromptBuild = buildBoundedPrompt(systemPrompt, recoveryHistoryPrefix, recoveryPromptSource, FRESH_SESSION_PROMPT_CHARS);
+            // A recreated chat that already has a conversation behind it is not a
+            // brand-new one, so it may seed far more context than the tiny fresh cap.
+            // Only a genuinely first-ever turn gets FRESH_SESSION_PROMPT_CHARS.
+            const conversationHasHistory = session.history.length > 0 || Boolean(session.summary) || Boolean(session.handover) || useDelta;
+            const recoverySeedBudget = selectSeedBudget(conversationHasHistory);
+            const livePromptBudget = session.id ? MAX_UPSTREAM_PROMPT_CHARS : recoverySeedBudget;
+            const promptBuild = buildBoundedPrompt(systemPrompt, historyPrefix, livePrompt, livePromptBudget);
+            const freshPromptBuild = buildBoundedPrompt(recoverySystemPrompt, recoveryHistoryPrefix, recoveryPromptSource, recoverySeedBudget);
             let fullPrompt = promptBuild.prompt;
             let promptCompacted = promptBuild.compacted;
             if (promptBuild.compacted) {
                 markContextCompacted(res);
-                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}${session.id ? '' : ' (new chat budget)'}`);
+                console.log(`${agentTag} Compacted upstream prompt ${promptBuild.originalChars} -> ${promptBuild.promptChars} chars${promptBuild.historyDropped ? ' (recovery history dropped)' : ''}${session.id ? '' : ` (seed budget ${livePromptBudget})`}`);
+            } else if (!session.id) {
+                console.log(`${agentTag} Recovery seed ${fullPrompt.length} chars (budget ${livePromptBudget}${conversationHasHistory ? ', rollover' : ', fresh'}).`);
             }
 
             const startTime = Date.now();
@@ -3229,14 +3663,15 @@ const server = http.createServer(async (req, res) => {
                 // when continuing a live chat, the full transcript when recreating one.
                 // Sizing it from the previous attempt instead would clamp a replayed
                 // transcript to the size of the delta that preceded it.
-                const retrySource = reuseSession ? prompt : recoveryPromptSource;
+                const retrySource = reuseSession ? livePrompt : recoveryPromptSource;
                 const retryHistory = reuseSession ? '' : recoveryHistoryPrefix;
+                const retrySystem = reuseSession ? systemPrompt : recoverySystemPrompt;
                 const retryBudget = buildRetryBudget(
-                    assembledPromptLength(systemPrompt, retryHistory, retrySource),
+                    assembledPromptLength(retrySystem, retryHistory, retrySource),
                     retryAttempt,
                 );
                 const retryBuild = buildRetryPrompt(
-                    systemPrompt,
+                    retrySystem,
                     retryHistory,
                     retrySource,
                     fullPrompt,
@@ -3374,13 +3809,17 @@ const server = http.createServer(async (req, res) => {
                 if (isContextTooLongError(modelError) && !contextEmergencyTried) {
                     contextEmergencyTried = true;
                     const lastUser = [...messages].reverse().find(m => m && m.role === 'user');
+                    // Carry the handover summary (when we have one) so the emergency
+                    // chat keeps the gist of the work instead of only the last question.
+                    const progress = sessionProgressText(session);
+                    const summarySeed = progress ? `[Session handover]\n${progress}\n\n` : '';
                     const emergencyPrompt = appendPromptInstruction(
-                        formatMessages(lastUser ? [lastUser] : messages.slice(-1), tools).prompt,
+                        summarySeed + formatMessages(lastUser ? [lastUser] : messages.slice(-1), tools).prompt,
                         'The earlier conversation was too long to include. Answer the latest user request on its own; if it depends on dropped context, say what is missing.',
-                        Math.floor(FRESH_SESSION_PROMPT_CHARS * 0.5)
+                        Math.floor(FRESH_SESSION_PROMPT_CHARS * 0.5) + summarySeed.length
                     );
                     resetRemoteSession(session);
-                    console.log(`${agentTag} context too long after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}; emergency fresh-session attempt with the last user turn only`);
+                    console.log(`${agentTag} context too long after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}; emergency fresh-session attempt with the last user turn${summarySeed ? ' + handover summary' : ' only'}`);
                     const emergencyCall = await askDeepSeekStream(emergencyPrompt, agentId, requestedModel);
                     const emergencyResult = await readDeepSeekResponse(emergencyCall.resp.body);
                     const emergencyState = normalizeRetryResponse(emergencyResult);
@@ -3758,12 +4197,14 @@ async function main() {
 }
 
 if (require.main === module) {
+    installFileLogging();
     // Don't let a stray rejection/throw take the whole proxy down silently.
     process.on('unhandledRejection', (reason) => console.error('[DS-API] unhandledRejection:', reason));
     process.on('uncaughtException', (err) => console.error('[DS-API] uncaughtException:', err));
     // Graceful shutdown: stop accepting, drain, then exit (force-exit after 10s).
     const shutdown = (sig) => {
         console.log(`[DS-API] ${sig} received — shutting down…`);
+        fileLogger.close();
         // Flush synchronously: the debounced writer may not have fired yet and
         // the remote chat ids in it are what make the next boot cheap.
         if (sessionPersistTimer) { clearTimeout(sessionPersistTimer); sessionPersistTimer = null; }
@@ -3824,6 +4265,34 @@ module.exports = {
         formatMessages,
         serializeAssistantTurn,
         selectDeltaMessages,
+        extractTodoLines,
+        buildSessionStateBlock,
+        extractTaskLine,
+        updateRollingSummary,
+        parseTodoContainer,
+        formatTodoEntry,
+        COMPACT_TOOL_REMINDER,
+        STATE_BLOCK_ENABLED,
+        ROLLING_SUMMARY_ENABLED,
+        ROLLING_SUMMARY_CHARS,
+        TODO_MAX_ITEMS,
+        ROLLOVER_PROMPT_CHARS,
+        PRIME_LARGE_FIRST_MESSAGE,
+        LLM_SUMMARY_ENABLED,
+        SUMMARY_INPUT_CHARS,
+        sessionRolloverReason,
+        selectSeedBudget,
+        sessionProgressText,
+        summarizeConversation,
+        readUpstreamText,
+        createFileLogger,
+        writeLogFile,
+        installFileLogging,
+        setLogLineHook,
+        stampLogText,
+        LOG_FILE_PATH,
+        LOG_FILE_ENABLED,
+        LOG_FILE_MAX_BYTES,
         MAX_HISTORY_LENGTH,
         MAX_HISTORY_CHARS,
         DS_FETCH_TIMEOUT_MS,

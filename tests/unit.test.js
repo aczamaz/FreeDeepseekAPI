@@ -1048,6 +1048,140 @@ test('delta prompt matches tool-call assistant turns and carries tool results', 
   assert.equal(serverInternals.serializeAssistantTurn({ role: 'user', content: 'x' }), null);
 });
 
+test('compact tool reminder drops schemas but keeps the names and output format', () => {
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'Read a file from disk',
+        parameters: { type: 'object', properties: { path: { type: 'string', description: 'path to read' } } },
+      },
+    },
+    { type: 'function', function: { name: 'write_file', description: 'Write a file', parameters: { type: 'object' } } },
+  ];
+  const full = serverInternals.formatToolDefinitions(tools);
+  const compact = serverInternals.formatToolDefinitions(tools, { compact: true });
+
+  assert.match(full, /Read a file from disk/);
+  assert.match(full, /"path"/);
+  assert.match(compact, /read_file/);
+  assert.match(compact, /write_file/);
+  assert.doesNotMatch(compact, /Read a file from disk/);
+  assert.doesNotMatch(compact, /"path"/);
+  assert.ok(compact.length < full.length);
+
+  // The reminder only replaces the definitions; the format contract survives.
+  assert.match(compact, /tool_call/);
+
+  const formatted = serverInternals.formatMessages(
+    [{ role: 'user', content: 'hi' }],
+    tools,
+    { compact: true },
+  );
+  assert.match(formatted.systemPrompt, /Available functions: read_file, write_file/);
+  assert.equal(formatted.prompt, 'User: hi');
+});
+
+test('state block carries the latest todo list and is empty without one', () => {
+  const withTodos = [
+    { role: 'user', content: 'do the thing' },
+    {
+      role: 'tool',
+      content: JSON.stringify([
+        { content: 'read config', status: 'completed' },
+        { content: 'patch server', status: 'in_progress' },
+        { content: 'write tests', status: 'pending' },
+      ]),
+    },
+  ];
+  const block = serverInternals.buildSessionStateBlock(withTodos, serverInternals.createSession());
+  assert.match(block, /\[SESSION STATE\]/);
+  assert.match(block, /- \[x\] read config/);
+  assert.match(block, /- \[>\] patch server/);
+  assert.match(block, /- \[ \] write tests/);
+  assert.match(block, /\[END SESSION STATE\]/);
+
+  // No todos and no summary => no block, so clients that never use todos pay nothing.
+  assert.equal(
+    serverInternals.buildSessionStateBlock([{ role: 'user', content: 'plain question' }], serverInternals.createSession()),
+    '',
+  );
+});
+
+test('todos fall back to markdown checkboxes when no JSON list is present', () => {
+  const messages = [
+    { role: 'assistant', content: 'Plan:\n- [ ] first step\n- [x] already done\n- [>] in progress' },
+  ];
+  const lines = serverInternals.extractTodoLines(messages);
+  assert.deepEqual(lines, ['- [ ] first step', '- [x] already done', '- [>] in progress']);
+
+  // A JSON object with no todo-shaped entries never shadows the checkbox fallback.
+  assert.deepEqual(serverInternals.parseTodoContainer('{"count":3}'), null);
+  assert.deepEqual(serverInternals.extractTodoLines([{ role: 'tool', content: '{"count":3}' }]), []);
+});
+
+test('rolling summary accumulates tasks, dedupes repeats and seeds recovery history', () => {
+  const session = serverInternals.createSession();
+  serverInternals.updateRollingSummary(session, 'User: first task\n\nAssistant: ok\n\n');
+  serverInternals.updateRollingSummary(session, 'User: first task\n\nAssistant: ok\n\n');
+  serverInternals.updateRollingSummary(session, 'User: second task\n\nAssistant: ok\n\n');
+  assert.equal(session.summary, 'first task\nsecond task');
+
+  // The digest is replayed when a remote chat is recreated, so a long session
+  // keeps its earlier tasks instead of restarting from the last few exchanges.
+  const prefix = serverInternals.buildRecoveryHistoryPrefix(
+    [{ user: 'last task', assistant: 'last answer' }],
+    session.summary,
+  );
+  assert.match(prefix, /Session progress/);
+  assert.match(prefix, /first task/);
+  assert.match(prefix, /second task/);
+  assert.match(prefix, /Previous conversation/);
+  assert.match(prefix, /last answer/);
+
+  // Summary alone (no history) still produces a usable recovery prefix.
+  const summaryOnly = serverInternals.buildRecoveryHistoryPrefix([], 'solo task');
+  assert.match(summaryOnly, /solo task/);
+});
+
+test('file logger stamps each line and rotates once the size cap is crossed', async () => {
+  const stamped = serverInternals.stampLogText('first\n\nsecond');
+  const lines = stamped.split('\n');
+  assert.match(lines[0], /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] first$/);
+  assert.equal(lines[1], '');
+  assert.match(lines[2], /\] second$/);
+
+  const dir = tmpdir();
+  const file = path.join(dir, 'proxy.log');
+  const logger = serverInternals.createFileLogger(file, 50);
+  logger.write('a'.repeat(30) + '\n');
+  logger.write('b'.repeat(30) + '\n'); // pushes the running total past the cap
+  logger.write('c'.repeat(10) + '\n'); // cap already crossed -> rotates first
+  await new Promise(resolve => setTimeout(resolve, 60));
+
+  assert.match(fs.readFileSync(`${file}.1`, 'utf8'), /a{30}/);
+  assert.match(fs.readFileSync(`${file}.1`, 'utf8'), /b{30}/);
+  assert.match(fs.readFileSync(file, 'utf8'), /c{10}/);
+});
+
+test('installFileLogging tees console output to the configured file', () => {
+  const dir = tmpdir();
+  const file = path.join(dir, 'proxy.log');
+  const res = runNode(['-e', [
+    `process.env.DEEPSEEK_LOG_FILE = ${JSON.stringify(file)};`,
+    "const { __test } = require('./server.js');",
+    '__test.installFileLogging();',
+    "console.log('hello-from-tee');",
+  ].join('\n')]);
+  assert.equal(res.status, 0, res.stderr || res.stdout);
+  const content = fs.readFileSync(file, 'utf8');
+  assert.match(content, /\[DS-API\] file logging started/);
+  assert.match(content, /hello-from-tee/);
+  // Every persisted line is timestamped so a long run can be replayed afterwards.
+  assert.match(content, /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] hello-from-tee/);
+});
+
 test('recovery buffer and timeouts stay small and generous by default', () => {
   assert.equal(serverInternals.MAX_HISTORY_LENGTH, 3);
   assert.equal(serverInternals.MAX_HISTORY_CHARS, 2000);
@@ -1542,17 +1676,31 @@ test('cross-account continuation is accepted only with a fresh recovery prompt',
   }), false);
 });
 
-test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
+test('depth rollover is lazy by default and works when a cap is configured', () => {
+  // Default is 0: an otherwise-healthy chat is never reset on a message timer,
+  // only on a real context error / TTL / rotation.
+  assert.equal(serverInternals.MAX_MESSAGE_DEPTH, 0);
+
   const depthSession = serverInternals.createSession();
   depthSession.id = 'deep-session';
-  depthSession.messageCount = serverInternals.MAX_MESSAGE_DEPTH;
+  depthSession.messageCount = 250;
   depthSession.accountId = 'account_1';
   depthSession.history.push({ user: 'u', assistant: 'a' });
-  const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now());
+  assert.equal(serverInternals.prepareSessionForPrompt(depthSession, Date.now()), null);
+
+  // An explicit positive depth restores the proactive reset, preserving recovery state.
+  const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now(), 100);
   assert.equal(depthReset.reason, 'max_message_depth');
   assert.equal(depthSession.id, null);
   assert.equal(depthSession.history.length, 1);
   assert.equal(depthSession.accountId, 'account_1');
+
+  // sessionRolloverReason is the non-mutating peek the caller uses to summarize first.
+  const peek = serverInternals.createSession();
+  peek.id = 'peek-session';
+  peek.messageCount = 250;
+  assert.equal(serverInternals.sessionRolloverReason(peek, Date.now(), 100), 'max_message_depth');
+  assert.equal(peek.id, 'peek-session');
 
   const now = Date.now();
   const ttlSession = serverInternals.createSession();
@@ -1566,6 +1714,61 @@ test('TTL and depth rollover happens before prompt construction and preserves re
   freshTtlSession.id = 'recent-session';
   freshTtlSession.createdAt = now - Math.floor(serverInternals.SESSION_TTL_MS / 2);
   assert.equal(serverInternals.prepareSessionForPrompt(freshTtlSession, now), null);
+});
+
+test('a recreated chat seeds with the large rollover budget, a first turn with the fresh cap', () => {
+  assert.ok(serverInternals.ROLLOVER_PROMPT_CHARS > serverInternals.FRESH_SESSION_PROMPT_CHARS);
+  assert.equal(serverInternals.selectSeedBudget(true), serverInternals.ROLLOVER_PROMPT_CHARS);
+  assert.equal(serverInternals.selectSeedBudget(false), serverInternals.FRESH_SESSION_PROMPT_CHARS);
+
+  // The rollover budget actually preserves far more of a long transcript.
+  const transcript = 'User: ' + 'x'.repeat(40000);
+  const system = 'SYSTEM';
+  const rollover = serverInternals.buildBoundedPrompt(system, '', transcript, serverInternals.ROLLOVER_PROMPT_CHARS);
+  const fresh = serverInternals.buildBoundedPrompt(system, '', transcript, serverInternals.FRESH_SESSION_PROMPT_CHARS);
+  assert.ok(rollover.prompt.length > fresh.prompt.length);
+  assert.equal(fresh.compacted, true);
+});
+
+test('readUpstreamText extracts content and the message id from an SSE body', async () => {
+  const stream = Readable.from([
+    Buffer.from('data: {"response_message_id":"m9","p":"response/fragments","v":[{"type":"RESPONSE","content":"hi "}]}\n'),
+    Buffer.from('data: {"p":"response/fragments/-1/content","v":"there"}\n'),
+  ]);
+  const result = await serverInternals.readUpstreamText(stream);
+  assert.equal(result.content, 'hi there');
+  assert.equal(result.messageId, 'm9');
+});
+
+test('summarizeConversation short-circuits a trivial transcript without an upstream call', async () => {
+  assert.equal(await serverInternals.summarizeConversation('agent', 'deepseek-chat', 'too short'), '');
+  assert.equal(await serverInternals.summarizeConversation('agent', 'deepseek-chat', ''), '');
+});
+
+test('handover summary survives the per-turn digest and seeds state/recovery', () => {
+  const session = serverInternals.createSession();
+  session.handover = 'GOAL: fix auth\nDONE: patched server.js';
+  serverInternals.updateRollingSummary(session, 'User: add tests\n\nAssistant: ok\n\n');
+  // The digest is its own field, so it never overwrites the handover note.
+  assert.equal(session.handover, 'GOAL: fix auth\nDONE: patched server.js');
+  assert.equal(session.summary, 'add tests');
+
+  const progress = serverInternals.sessionProgressText(session);
+  assert.match(progress, /GOAL: fix auth/);
+  assert.match(progress, /add tests/);
+
+  const block = serverInternals.buildSessionStateBlock([], session);
+  assert.match(block, /GOAL: fix auth/);
+  assert.match(block, /add tests/);
+
+  const prefix = serverInternals.buildRecoveryHistoryPrefix([], serverInternals.sessionProgressText(session));
+  assert.match(prefix, /GOAL: fix auth/);
+});
+
+test('priming and LLM summary are on by default', () => {
+  assert.equal(serverInternals.PRIME_LARGE_FIRST_MESSAGE, true);
+  assert.equal(serverInternals.LLM_SUMMARY_ENABLED, true);
+  assert.ok(serverInternals.SUMMARY_INPUT_CHARS > 0);
 });
 
 test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {
