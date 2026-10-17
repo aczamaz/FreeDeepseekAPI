@@ -12,6 +12,8 @@
  * Listens on 127.0.0.1:9655 by default (HOST is configurable)
  */
 
+require('dotenv').config();
+
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
